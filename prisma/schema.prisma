@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Compteur {
+  id            Int            @id @default(autoincrement())
+  quartier      String
+  localisation  String
+  loue          Boolean        @default(false)
+
+  codeImmeuble  String         @default("N/A")
+  nomPropriete  String         @default("N/A")
+  typeBien      String         @default("placement")
+  province      String         @default("N/A")
+  adresse       String         @default("N/A")
+  rg            String
+
+  sousCompteurs SousCompteur[]  // 🔗 Relation 1 - n avec sous-compteurs
+  payments      Payment[]
+}
+
+model SousCompteur {
+  id             Int       @id @default(autoincrement())
+  numeroCompteur String    @unique
+  numeroFacture  String?
+  montant        Int?
+  compteurId     Int
+  compteur       Compteur  @relation(fields: [compteurId], references: [id])
+}
+
+model PaymentBatch {
+  id       Int       @id @default(autoincrement())
+  date     DateTime  @default(now())
+  total    Int
+  payments Payment[]
+}
+
+model Payment {
+  id             Int          @id @default(autoincrement())
+  montant        Int
+  numeroFacture  String?
+  numeroCompteur String       // <-- Ajouté
+  compteurId     Int
+  compteur       Compteur     @relation(fields: [compteurId], references: [id])
+  batchId        Int
+  batch          PaymentBatch @relation(fields: [batchId], references: [id])
+}
