@@ -62,29 +62,56 @@ app.post('/api/compteurs', async (req, res) => {
 });
 
 // PUT compteur
+// PUT compteur (avec mise à jour des sous-compteurs)
 app.put('/api/compteurs/:id', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const data = req.body;
-    const updated = await prisma.compteur.update({
-      where: { id },
-      data: {
-        quartier: data.quartier,
-        localisation: data.localisation,
-        loue: data.loue ?? undefined,
-        codeImmeuble: data.codeImmeuble,
-        nomPropriete: data.nomPropriete,
-        rg: data.rg,
-        typeBien: data.typeBien,
-        province: data.province,
-        adresse: data.adresse
-      },
-      include: { sousCompteurs: true }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      // 1️⃣ Met à jour le compteur principal
+      const compteur = await tx.compteur.update({
+        where: { id },
+        data: {
+          quartier: data.quartier,
+          localisation: data.localisation,
+          loue: data.loue ?? undefined,
+          codeImmeuble: data.codeImmeuble,
+          nomPropriete: data.nomPropriete,
+          rg: data.rg,
+          typeBien: data.typeBien,
+          province: data.province,
+          adresse: data.adresse
+        }
+      });
+
+      // 2️⃣ Supprime les anciens sous-compteurs
+      await tx.sousCompteur.deleteMany({ where: { compteurId: id } });
+
+      // 3️⃣ Ajoute les nouveaux sous-compteurs
+      if (Array.isArray(data.sousCompteurs) && data.sousCompteurs.length > 0) {
+        await tx.sousCompteur.createMany({
+          data: data.sousCompteurs.map(sc => ({
+            numeroCompteur: sc.numeroCompteur,
+            compteurId: id
+          }))
+        });
+      }
+
+      // 4️⃣ Retourne le compteur avec ses nouveaux sous-compteurs
+      return tx.compteur.findUnique({
+        where: { id },
+        include: { sousCompteurs: true }
+      });
     });
+
     res.json(updated);
   } catch (err) {
     console.error(err);
-    res.status(400).json({ message: 'Erreur mise à jour compteur', detail: err.message });
+    res.status(400).json({
+      message: 'Erreur mise à jour compteur',
+      detail: err.message
+    });
   }
 });
 
@@ -194,7 +221,7 @@ app.get('/api/payment-batches/:id', async (req, res) => {
   }
 });
 
-// GET batch PDF
+// GET batch PDF structuré et corrigé
 app.get('/api/payment-batches/:id/pdf', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -209,23 +236,179 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename=batch_${id}.pdf`);
     doc.pipe(res);
 
-    doc.fontSize(18).text('ASSURANCE ARO', { align: 'center' });
-    doc.moveDown(0.5);
-    doc.fontSize(14).text(`Reçu de Paiement #${id}`, { align: 'center' });
-    doc.moveDown(1);
-    doc.fontSize(12).text(`Date: ${new Date(batch.date).toLocaleString()}`);
-    doc.text(`Total: ${batch.total.toLocaleString()} Ar`).moveDown(1);
+    // ======== Fonctions utilitaires ========
+    const startX = 40;
+    const colWidths = [90, 120, 70, 100, 100];
+    const headers = ['Quartier', 'Adresse', 'RG', 'N° Facture', 'Montant'];
+    const tableWidth = colWidths.reduce((a, b) => a + b, 0);
 
-    batch.payments.forEach((p, i) => {
-      const c = p.compteur;
-      doc.text(`${i + 1}. ${c.nomPropriete} (${c.codeImmeuble})`);
-      doc.text(`   Adresse : ${c.adresse}, ${c.province}`);
-      doc.text(`   N° Compteur : ${p.numeroFacture ?? 'N/A'}`);
-      doc.text(`   Montant : ${p.montant?.toLocaleString()} Ar`).moveDown(0.5);
+    function formatMontant(valeur) {
+      const montant = typeof valeur === 'number' ? valeur : 0;
+      return montant.toLocaleString('fr-FR', {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      }).replace(/\//g, '').replace(/\u00A0/g, ' ');
+    }
+
+    function drawHorizontalLine(yPos) {
+      doc.moveTo(startX, yPos).lineTo(startX + tableWidth, yPos).stroke();
+    }
+
+    function drawVerticalLines(yTop, yBottom) {
+      let x = startX;
+      for (let width of colWidths) {
+        doc.moveTo(x, yTop).lineTo(x, yBottom).stroke();
+        x += width;
+      }
+      doc.moveTo(startX + tableWidth, yTop).lineTo(startX + tableWidth, yBottom).stroke();
+    }
+
+    // ======== En-tête PDF ========
+    const dateBatch = new Date(batch.date);
+    const mois = dateBatch.toLocaleString('fr-FR', { month: 'long' });
+    const annee = dateBatch.getFullYear();
+
+    doc.fontSize(14).font('Helvetica-Bold').text('Note: Département comptabilité Générales ARO', { align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${mois.toUpperCase()} ${annee}`, { align: 'center' });
+    doc.moveDown(0.5);
+    doc.font('Helvetica').fontSize(11).text(
+      `Veuillez émettre à l'ordre de la JIRAMA un chèque de ${formatMontant(batch.total)} Ariary en règlement des factures ci-après énumérées.`,
+      { align: 'center' }
+    );
+    doc.moveDown(1.5);
+
+    // ======== Tri par quartier ========
+    const paiementsTries = batch.payments.sort((a, b) => {
+      const q1 = a.compteur.quartier?.toLowerCase() || '';
+      const q2 = b.compteur.quartier?.toLowerCase() || '';
+      return q1.localeCompare(q2);
     });
 
+    // ======== Tableau ========
+    let y = doc.y + 10;
+
+    // En-têtes en gras
+    doc.font('Helvetica-Bold').fontSize(11);
+    drawHorizontalLine(y);
+    let x = startX;
+    headers.forEach((h, i) => {
+      doc.text(h, x, y + 5, { width: colWidths[i], align: 'center' });
+      x += colWidths[i];
+    });
+    y += 20;
+    drawHorizontalLine(y);
+    drawVerticalLines(y - 20, y);
+
+    // Contenu en normal, sous-totaux en gras
+    doc.font('Helvetica').fontSize(10);
+    let currentQuartier = null;
+    let sousTotal = 0;
+    let yStartQuartier = y;
+
+    for (let p of paiementsTries) {
+      const c = p.compteur;
+      const quartier = c.quartier || 'Non défini';
+
+      // Sous-total si changement de quartier
+      if (currentQuartier && currentQuartier !== quartier) {
+        y += 4;
+        drawHorizontalLine(y);
+        y += 4;
+
+        x = startX;
+        for (let i = 0; i < 3; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+        doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[3], align: 'center' });
+        x += colWidths[3];
+        doc.text(formatMontant(sousTotal), x, y, { width: colWidths[4], align: 'center' });
+
+        y += 16;
+        drawHorizontalLine(y);
+        drawVerticalLines(yStartQuartier, y);
+        yStartQuartier = y;
+        sousTotal = 0;
+      }
+
+      currentQuartier = quartier;
+      sousTotal += p.montant || 0;
+
+      // Ligne paiement en normal
+      y += 4;
+      x = startX;
+      const cells = [
+        quartier,
+        c.adresse || '-',
+        c.codeImmeuble || '-',
+        p.numeroFacture || 'N/A',
+        formatMontant(p.montant)
+      ];
+      doc.font('Helvetica').fontSize(10); // ligne normale
+      cells.forEach((text, i) => {
+        doc.text(text, x, y, { width: colWidths[i], align: 'center' });
+        x += colWidths[i];
+      });
+      y += 16;
+      drawHorizontalLine(y);
+      drawVerticalLines(yStartQuartier, y);
+    }
+
+    // Dernier sous-total en gras
+    y += 4;
+    drawHorizontalLine(y);
+    y += 4;
+    x = startX;
+    for (let i = 0; i < 3; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+    doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[3], align: 'center' });
+    x += colWidths[3];
+    doc.text(formatMontant(sousTotal), x, y, { width: colWidths[4], align: 'center' });
+    y += 16;
+    drawHorizontalLine(y);
+    drawVerticalLines(yStartQuartier, y);
+
+    // ======== Ligne TOTAL GÉNÉRAL dans le tableau ========
+    y += 4;
+    drawHorizontalLine(y);
+    y += 4;
+    x = startX;
+    for (let i = 0; i < 3; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+    doc.font('Helvetica-Bold').text('TOTAL GÉNÉRAL', x, y, { width: colWidths[3], align: 'center' });
+    x += colWidths[3];
+    doc.text(formatMontant(batch.total), x, y, { width: colWidths[4], align: 'center' });
+    y += 16;
+    drawHorizontalLine(y);
+    drawVerticalLines(yStartQuartier, y);
+
+    y += 20; // espace après le tableau
+    doc.font('Helvetica-Bold').fontSize(12).text(`Montant Total :`, startX, y, { align: 'left' });
+    y += 30; // espace avant les signatures
+
+    // ======== Signatures manuscrites ========
+    y += 20;
+    const signatures = [
+      'Services Etudes et Travaux',
+      'Services Administratif et Financiers',
+      'Tolotra RANDRIANALAINA',
+      'Haingo RAZAFINIAINA'
+    ];
+
+    // On élargit l'espace horizontal en utilisant 2 colonnes plus larges
+    const sigColWidth = tableWidth / 2 + 20; // +20 pour plus d'espacement
+
+    // Ligne 1 : deux premières signatures
+    doc.font('Helvetica').fontSize(11);
+    doc.text(signatures[0], startX, y, { width: sigColWidth, align: 'center' });
+    doc.text(signatures[1], startX + sigColWidth + 20, y, { width: sigColWidth, align: 'center' });
+
+    y += 60; // espace pour signature manuscrite
+
+    // Ligne 2 : deux dernières signatures
+    doc.text(signatures[2], startX, y, { width: sigColWidth, align: 'center' });
+    doc.text(signatures[3], startX + sigColWidth + 20, y, { width: sigColWidth, align: 'center' });
+
     doc.end();
+
   } catch (err) {
+    console.error(err);
     res.status(500).json({ message: 'Erreur PDF', detail: err.message });
   }
 });

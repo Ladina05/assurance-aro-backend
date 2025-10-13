@@ -28,7 +28,7 @@ model SousCompteur {
   id             Int       @id @default(autoincrement())
   numeroCompteur String    @unique
   numeroFacture  String?
-  montant        Int?
+  montant        Float?
   compteurId     Int
   compteur       Compteur  @relation(fields: [compteurId], references: [id])
 }
@@ -42,7 +42,7 @@ model PaymentBatch {
 
 model Payment {
   id             Int          @id @default(autoincrement())
-  montant        Int
+  montant        Float
   numeroFacture  String?
   numeroCompteur String       // <-- Ajouté
   compteurId     Int
