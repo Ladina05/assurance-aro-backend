@@ -18,7 +18,8 @@ async function main() {
           { numeroCompteur: "C001-1", numeroFacture: "F001", montant: 12000 },
           { numeroCompteur: "C001-2", numeroFacture: "F002", montant: 8000 }
         ]
-      }
+      },
+      typeCompteur: "eau",
     },
     {
       quartier: "Isoraka",
@@ -34,7 +35,8 @@ async function main() {
         create: [
           { numeroCompteur: "C002-1", numeroFacture: "F003", montant: 9000 }
         ]
-      }
+      },
+      typeCompteur: "électricité",
     }
   ];
 

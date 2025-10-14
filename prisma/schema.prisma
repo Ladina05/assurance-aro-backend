@@ -7,6 +7,14 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model User {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String   @unique
+  password  String
+  createdAt DateTime @default(now())
+}
+
 model Compteur {
   id            Int            @id @default(autoincrement())
   quartier      String
@@ -19,6 +27,7 @@ model Compteur {
   province      String         @default("N/A")
   adresse       String         @default("N/A")
   rg            String
+  typeCompteur  String         @default("eau")
 
   sousCompteurs SousCompteur[]  // 🔗 Relation 1 - n avec sous-compteurs
   payments      Payment[]
@@ -36,7 +45,7 @@ model SousCompteur {
 model PaymentBatch {
   id       Int       @id @default(autoincrement())
   date     DateTime  @default(now())
-  total    Int
+  total    Float
   payments Payment[]
 }
 
@@ -44,7 +53,8 @@ model Payment {
   id             Int          @id @default(autoincrement())
   montant        Float
   numeroFacture  String?
-  numeroCompteur String       // <-- Ajouté
+  numeroCompteur String
+  typeCompteur   String
   compteurId     Int
   compteur       Compteur     @relation(fields: [compteurId], references: [id])
   batchId        Int

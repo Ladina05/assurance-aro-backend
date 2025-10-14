@@ -4,6 +4,7 @@ const cors = require('cors');
 const prisma = require('./prismaClient');
 const bodyParser = require('express').json;
 const PDFDocument = require('pdfkit');
+const authRoutes = require('./routes/auth');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -38,7 +39,7 @@ app.get('/api/compteurs', async (req, res) => {
 // POST compteur
 app.post('/api/compteurs', async (req, res) => {
   try {
-    const { quartier, localisation, loue, codeImmeuble, nomPropriete, rg, typeBien, province, adresse, sousCompteurs } = req.body;
+    const { quartier, localisation, loue, codeImmeuble, nomPropriete, rg, typeBien, province, adresse, sousCompteurs, typeCompteur } = req.body;
     const newC = await prisma.compteur.create({
       data: {
         quartier,
@@ -50,7 +51,8 @@ app.post('/api/compteurs', async (req, res) => {
         typeBien,
         province,
         adresse,
-        sousCompteurs: { create: sousCompteurs || [] }
+        sousCompteurs: { create: sousCompteurs || [] },
+        typeCompteur
       },
       include: { sousCompteurs: true }
     });
@@ -81,7 +83,8 @@ app.put('/api/compteurs/:id', async (req, res) => {
           rg: data.rg,
           typeBien: data.typeBien,
           province: data.province,
-          adresse: data.adresse
+          adresse: data.adresse,
+          typeCompteur: data.typeCompteur
         }
       });
 
@@ -173,24 +176,40 @@ app.post('/api/payment-batches', async (req, res) => {
       include: { sousCompteurs: true }
     });
 
-    const sousCompteurs = compteurs.flatMap(c => c.sousCompteurs).filter(s => s.montant && s.montant > 0);
-    if (sousCompteurs.length === 0)
+    const sousCompteurs = compteurs
+      .flatMap(c => c.sousCompteurs.map(s => ({ ...s, compteur: c }))) // ✅ on attache le compteur à chaque sous-compteur
+      .filter(s => s.montant != null && !isNaN(s.montant) && parseFloat(s.montant) > 0);
+
+    if (!sousCompteurs.length)
       return res.status(400).json({ message: 'Aucun montant à payer' });
 
-    const total = sousCompteurs.reduce((sum, s) => sum + s.montant, 0);
+    const total = sousCompteurs.reduce((sum, s) => sum + parseFloat(s.montant), 0);
 
-    const result = await prisma.$transaction(async (tx) => {
-      const batch = await tx.paymentBatch.create({ data: { total } });
+    const batch = await prisma.$transaction(async (tx) => {
+      const newBatch = await tx.paymentBatch.create({ data: { total } });
+
       for (const s of sousCompteurs) {
         await tx.payment.create({
-          data: { montant: s.montant, numeroFacture: s.numeroFacture,numeroCompteur: s.numeroCompteur, compteurId: s.compteurId, batchId: batch.id }
+          data: {
+            montant: parseFloat(s.montant),
+            numeroFacture: s.numeroFacture,
+            numeroCompteur: s.numeroCompteur,
+            typeCompteur: s.compteur.typeCompteur, // ✅ correction ici
+            compteurId: s.compteurId,
+            batchId: newBatch.id
+          }
         });
-        await tx.sousCompteur.update({ where: { id: s.id }, data: { montant: null, numeroFacture: null } });
+
+        await tx.sousCompteur.update({
+          where: { id: s.id },
+          data: { montant: null, numeroFacture: null }
+        });
       }
-      return batch;
+
+      return newBatch;
     });
 
-    res.status(201).json({ message: 'Paiement effectué', batch: result });
+    res.status(201).json({ message: 'Paiement effectué', batch });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Erreur paiement', detail: err.message });
@@ -201,6 +220,7 @@ app.post('/api/payment-batches', async (req, res) => {
 app.get('/api/payment-batches', async (req, res) => {
   try {
     const batches = await prisma.paymentBatch.findMany({ orderBy: { date: 'desc' } });
+    // Prisma renvoie déjà des Float si le champ total est Float
     res.json(batches);
   } catch (err) {
     res.status(500).json({ message: 'Erreur récupération historique' });
@@ -215,9 +235,37 @@ app.get('/api/payment-batches/:id', async (req, res) => {
       where: { id },
       include: { payments: { include: { compteur: true } } }
     });
-    res.json(batch);
+
+    if (!batch) return res.status(404).json({ message: 'Batch non trouvé' });
+
+    // Assurer que les montants sont bien des Float
+    const paymentsWithFloat = batch.payments.map(p => ({
+      ...p,
+      montant: parseFloat(p.montant)
+    }));
+
+    res.json({ ...batch, payments: paymentsWithFloat, total: parseFloat(batch.total) });
   } catch (err) {
     res.status(500).json({ message: 'Erreur récupération batch' });
+  }
+});
+
+// DELETE batch
+app.delete('/api/payment-batches/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+
+    await prisma.$transaction(async (tx) => {
+      // Supprimer tous les paiements associés
+      await tx.payment.deleteMany({ where: { batchId: id } });
+      // Supprimer le batch
+      await tx.paymentBatch.delete({ where: { id } });
+    });
+
+    res.json({ message: 'Historique supprimé' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Erreur suppression batch', detail: err.message });
   }
 });
 
@@ -237,17 +285,20 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     doc.pipe(res);
 
     // ======== Fonctions utilitaires ========
-    const startX = 40;
-    const colWidths = [90, 120, 70, 100, 100];
-    const headers = ['Quartier', 'Adresse', 'RG', 'N° Facture', 'Montant'];
+    const startX = 15;
+    const colWidths = [90, 120, 100, 70, 100, 100];
+    const headers = ['Quartier', 'Adresse', 'RG','Type', 'N° Facture', 'Montant (Ar)'];
     const tableWidth = colWidths.reduce((a, b) => a + b, 0);
 
     function formatMontant(valeur) {
       const montant = typeof valeur === 'number' ? valeur : 0;
+      // Utilise le séparateur d’espace insécable correct
       return montant.toLocaleString('fr-FR', {
+        style: 'decimal',
         minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }).replace(/\//g, '').replace(/\u00A0/g, ' ');
+        maximumFractionDigits: 2,
+        useGrouping: true
+      }).replace(/\u202F/g, ' '); // remplace les espaces insécables par de vrais espaces
     }
 
     function drawHorizontalLine(yPos) {
@@ -263,6 +314,8 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
       doc.moveTo(startX + tableWidth, yTop).lineTo(startX + tableWidth, yBottom).stroke();
     }
 
+    const totalGeneral = batch.payments.reduce((sum, p) => sum + (p.montant || 0), 0);
+
     // ======== En-tête PDF ========
     const dateBatch = new Date(batch.date);
     const mois = dateBatch.toLocaleString('fr-FR', { month: 'long' });
@@ -273,8 +326,8 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${mois.toUpperCase()} ${annee}`, { align: 'center' });
     doc.moveDown(0.5);
     doc.font('Helvetica').fontSize(11).text(
-      `Veuillez émettre à l'ordre de la JIRAMA un chèque de ${formatMontant(batch.total)} Ariary en règlement des factures ci-après énumérées.`,
-      { align: 'center' }
+      `Veuillez émettre à l'ordre de la JIRAMA un chèque de ${formatMontant(totalGeneral)} Ariary en règlement des factures ci-après énumérées.`,
+      { align: 'left' }
     );
     doc.moveDown(1.5);
 
@@ -288,7 +341,7 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     // ======== Tableau ========
     let y = doc.y + 10;
 
-    // En-têtes en gras
+    // En-têtes du tableau (gras)
     doc.font('Helvetica-Bold').fontSize(11);
     drawHorizontalLine(y);
     let x = startX;
@@ -298,9 +351,9 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     });
     y += 20;
     drawHorizontalLine(y);
-    drawVerticalLines(y - 20, y);
+    drawVerticalLines(y - 20, y); // bordures verticales des en-têtes
 
-    // Contenu en normal, sous-totaux en gras
+    // Contenu du tableau (normal pour les lignes)
     doc.font('Helvetica').fontSize(10);
     let currentQuartier = null;
     let sousTotal = 0;
@@ -310,70 +363,76 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
       const c = p.compteur;
       const quartier = c.quartier || 'Non défini';
 
-      // Sous-total si changement de quartier
+      // Affiche un sous-total si on change de quartier
       if (currentQuartier && currentQuartier !== quartier) {
         y += 4;
         drawHorizontalLine(y);
         y += 4;
 
+        // Sous-total (gras)
         x = startX;
-        for (let i = 0; i < 3; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-        doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[3], align: 'center' });
-        x += colWidths[3];
-        doc.text(formatMontant(sousTotal), x, y, { width: colWidths[4], align: 'center' });
+        for (let i = 0; i < 4; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+        doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[4], align: 'center' });
+        x += colWidths[4];
+        doc.text(formatMontant(sousTotal), x, y, { width: colWidths[5], align: 'center' });
 
         y += 16;
         drawHorizontalLine(y);
         drawVerticalLines(yStartQuartier, y);
         yStartQuartier = y;
         sousTotal = 0;
+
+        // Revenir au texte normal pour les lignes suivantes
+        doc.font('Helvetica').fontSize(10);
       }
 
       currentQuartier = quartier;
       sousTotal += p.montant || 0;
 
-      // Ligne paiement en normal
+      // Ligne normale du paiement (texte normal)
       y += 4;
       x = startX;
       const cells = [
         quartier,
         c.adresse || '-',
-        c.codeImmeuble || '-',
+        c.rg || '-',
+        c.typeCompteur || '-',
         p.numeroFacture || 'N/A',
         formatMontant(p.montant)
       ];
-      doc.font('Helvetica').fontSize(10); // ligne normale
+
       cells.forEach((text, i) => {
         doc.text(text, x, y, { width: colWidths[i], align: 'center' });
         x += colWidths[i];
       });
+
       y += 16;
       drawHorizontalLine(y);
-      drawVerticalLines(yStartQuartier, y);
+      drawVerticalLines(y - 20, y);
     }
 
-    // Dernier sous-total en gras
+    // Dernier sous-total du dernier quartier (gras)
     y += 4;
     drawHorizontalLine(y);
     y += 4;
     x = startX;
-    for (let i = 0; i < 3; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-    doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[3], align: 'center' });
-    x += colWidths[3];
-    doc.text(formatMontant(sousTotal), x, y, { width: colWidths[4], align: 'center' });
+    for (let i = 0; i < 4; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+    doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[4], align: 'center' });
+    x += colWidths[4];
+    doc.text(formatMontant(sousTotal), x, y, { width: colWidths[5], align: 'center' });
     y += 16;
     drawHorizontalLine(y);
     drawVerticalLines(yStartQuartier, y);
 
-    // ======== Ligne TOTAL GÉNÉRAL dans le tableau ========
+    // Ligne TOTAL GÉNÉRAL (gras)
     y += 4;
     drawHorizontalLine(y);
     y += 4;
     x = startX;
-    for (let i = 0; i < 3; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-    doc.font('Helvetica-Bold').text('TOTAL GÉNÉRAL', x, y, { width: colWidths[3], align: 'center' });
-    x += colWidths[3];
-    doc.text(formatMontant(batch.total), x, y, { width: colWidths[4], align: 'center' });
+    for (let i = 0; i < 4; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+    doc.font('Helvetica-Bold').text('TOTAL GÉNÉRAL', x, y, { width: colWidths[4], align: 'center' });
+    x += colWidths[4];
+    doc.text(formatMontant(totalGeneral), x, y, { width: colWidths[5], align: 'center' });
     y += 16;
     drawHorizontalLine(y);
     drawVerticalLines(yStartQuartier, y);
@@ -412,6 +471,8 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     res.status(500).json({ message: 'Erreur PDF', detail: err.message });
   }
 });
+
+app.use('/api/auth', authRoutes);
 
 /* ===============================
    🔹 Serveur
