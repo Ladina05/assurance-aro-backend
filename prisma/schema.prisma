@@ -20,22 +20,21 @@ model Compteur {
   quartier      String
   localisation  String
   loue          Boolean        @default(false)
-
   codeImmeuble  String         @default("N/A")
   nomPropriete  String         @default("N/A")
   typeBien      String         @default("placement")
   province      String         @default("N/A")
   adresse       String         @default("N/A")
   rg            String
-  typeCompteur  String         @default("eau")
 
-  sousCompteurs SousCompteur[]  // 🔗 Relation 1 - n avec sous-compteurs
+  sousCompteurs SousCompteur[]
   payments      Payment[]
 }
 
 model SousCompteur {
   id             Int       @id @default(autoincrement())
   numeroCompteur String    @unique
+  typeCompteur   String    @default("eau")
   numeroFacture  String?
   montant        Float?
   compteurId     Int
@@ -43,10 +42,12 @@ model SousCompteur {
 }
 
 model PaymentBatch {
-  id       Int       @id @default(autoincrement())
-  date     DateTime  @default(now())
-  total    Float
-  payments Payment[]
+  id        Int       @id @default(autoincrement())
+  date      DateTime  @default(now())
+  total     Float
+  payments  Payment[]
+  chequePdf String?
+  recuPdf String?
 }
 
 model Payment {

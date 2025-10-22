@@ -5,9 +5,26 @@ const prisma = require('./prismaClient');
 const bodyParser = require('express').json;
 const PDFDocument = require('pdfkit');
 const authRoutes = require('./routes/auth');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { toWords } = require('number-to-words');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    // Ajoutez le type de fichier (cheque/recu) dans le nom pour éviter les conflits
+    const fileType = file.fieldname; // 'cheque' ou 'recu'
+    cb(null, `batch_${req.params.id}_${fileType}${path.extname(file.originalname)}`);
+  }
+});
+const upload = multer({ storage });
 
 app.use(cors({ origin: 'http://localhost:5173' }));
 app.use(bodyParser());
@@ -51,8 +68,12 @@ app.post('/api/compteurs', async (req, res) => {
         typeBien,
         province,
         adresse,
-        sousCompteurs: { create: sousCompteurs || [] },
-        typeCompteur
+        sousCompteurs: {
+          create: sousCompteurs.map(sc => ({
+            numeroCompteur: sc.numeroCompteur,
+            typeCompteur: sc.typeCompteur || "eau"
+          }))
+        }
       },
       include: { sousCompteurs: true }
     });
@@ -96,6 +117,7 @@ app.put('/api/compteurs/:id', async (req, res) => {
         await tx.sousCompteur.createMany({
           data: data.sousCompteurs.map(sc => ({
             numeroCompteur: sc.numeroCompteur,
+            typeCompteur: sc.typeCompteur || "eau",
             compteurId: id
           }))
         });
@@ -164,6 +186,106 @@ app.put('/api/souscompteurs/:id', async (req, res) => {
   }
 });
 
+// Upload / Update PDF du chèque
+app.post('/api/payment-batches/:id/cheque', upload.single('cheque'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!req.file) return res.status(400).json({ message: "Fichier manquant" });
+
+    const updated = await prisma.paymentBatch.update({
+      where: { id },
+      data: { chequePdf: req.file.filename }
+    });
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Erreur upload chèque", detail: err.message });
+  }
+});
+
+// Télécharger le PDF du chèque
+app.get('/api/payment-batches/:id/cheque', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const batch = await prisma.paymentBatch.findUnique({ where: { id } });
+    if (!batch || !batch.chequePdf) return res.status(404).json({ message: "Chèque non trouvé" });
+
+    const filePath = path.join(uploadDir, batch.chequePdf);
+    res.download(filePath);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Erreur téléchargement chèque", detail: err.message });
+  }
+});
+
+// Supprimer le PDF du chèque
+app.delete('/api/payment-batches/:id/cheque', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const batch = await prisma.paymentBatch.findUnique({ where: { id } });
+    if (!batch || !batch.chequePdf) return res.status(404).json({ message: "Chèque non trouvé" });
+
+    const filePath = path.join(uploadDir, batch.chequePdf);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+    await prisma.paymentBatch.update({ where: { id }, data: { chequePdf: null } });
+    res.json({ message: "Chèque supprimé" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Erreur suppression chèque", detail: err.message });
+  }
+});
+
+// Upload / Update PDF du reçu
+app.post('/api/payment-batches/:id/recu', upload.single('recu'), async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!req.file) return res.status(400).json({ message: "Fichier manquant" });
+
+    const updated = await prisma.paymentBatch.update({
+      where: { id },
+      data: { recuPdf: req.file.filename }
+    });
+    res.json(updated);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Erreur upload reçu", detail: err.message });
+  }
+});
+
+// Télécharger le PDF du reçu
+app.get('/api/payment-batches/:id/recu', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const batch = await prisma.paymentBatch.findUnique({ where: { id } });
+    if (!batch || !batch.recuPdf) return res.status(404).json({ message: "Reçu non trouvé" });
+
+    const filePath = path.join(uploadDir, batch.recuPdf);
+    res.download(filePath);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Erreur téléchargement reçu", detail: err.message });
+  }
+});
+
+// Supprimer le PDF du reçu
+app.delete('/api/payment-batches/:id/recu', async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const batch = await prisma.paymentBatch.findUnique({ where: { id } });
+    if (!batch || !batch.recuPdf) return res.status(404).json({ message: "Reçu non trouvé" });
+
+    const filePath = path.join(uploadDir, batch.recuPdf);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+    await prisma.paymentBatch.update({ where: { id }, data: { recuPdf: null } });
+    res.json({ message: "Reçu supprimé" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Erreur suppression reçu", detail: err.message });
+  }
+});
+
 /* ===============================
    🔹 Paiement / Historique / PDF
 ================================= */
@@ -194,7 +316,7 @@ app.post('/api/payment-batches', async (req, res) => {
             montant: parseFloat(s.montant),
             numeroFacture: s.numeroFacture,
             numeroCompteur: s.numeroCompteur,
-            typeCompteur: s.compteur.typeCompteur, // ✅ correction ici
+            typeCompteur: s.typeCompteur,
             compteurId: s.compteurId,
             batchId: newBatch.id
           }
@@ -284,21 +406,19 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename=batch_${id}.pdf`);
     doc.pipe(res);
 
-    // ======== Fonctions utilitaires ========
     const startX = 15;
-    const colWidths = [90, 120, 100, 70, 100, 100];
-    const headers = ['Quartier', 'Adresse', 'RG','Type', 'N° Facture', 'Montant (Ar)'];
+    const colWidths = [80, 80, 80, 70, 70, 90, 90];
+    const headers = ['Province', 'Quartier', 'Adresse', 'RG','Type', 'N° Facture', 'Montant (Ar)'];
     const tableWidth = colWidths.reduce((a, b) => a + b, 0);
 
     function formatMontant(valeur) {
       const montant = typeof valeur === 'number' ? valeur : 0;
-      // Utilise le séparateur d’espace insécable correct
       return montant.toLocaleString('fr-FR', {
         style: 'decimal',
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
         useGrouping: true
-      }).replace(/\u202F/g, ' '); // remplace les espaces insécables par de vrais espaces
+      }).replace(/\u202F/g, ' ');
     }
 
     function drawHorizontalLine(yPos) {
@@ -314,7 +434,33 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
       doc.moveTo(startX + tableWidth, yTop).lineTo(startX + tableWidth, yBottom).stroke();
     }
 
-    const totalGeneral = batch.payments.reduce((sum, p) => sum + (p.montant || 0), 0);
+    // ======== Regrouper par numeroFacture ========
+    const groupedPayments = Object.values(
+      (batch.payments ?? []).reduce((acc, p) => {
+        const key = p.numeroFacture ?? `nofacture-${p.id}`;
+        if (!acc[key]) {
+          acc[key] = { 
+            ...p,
+            typeCompteur: [p.typeCompteur],
+            numeroCompteur: [p.numeroCompteur],
+            montant: p.montant ?? 0
+          };
+        } else {
+          acc[key].typeCompteur.push(p.typeCompteur);
+          acc[key].numeroCompteur.push(p.numeroCompteur);
+          acc[key].montant += p.montant ?? 0;
+        }
+        return acc;
+      }, {})
+    );
+
+    const paiementsTries = groupedPayments.sort((a, b) => {
+      const q1 = a.compteur.quartier?.toLowerCase() || '';
+      const q2 = b.compteur.quartier?.toLowerCase() || '';
+      return q1.localeCompare(q2);
+    });
+
+    const totalGeneral = paiementsTries.reduce((sum, p) => sum + (p.montant || 0), 0);
 
     // ======== En-tête PDF ========
     const dateBatch = new Date(batch.date);
@@ -325,18 +471,10 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     doc.moveDown(0.3);
     doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${mois.toUpperCase()} ${annee}`, { align: 'center' });
     doc.moveDown(0.5);
-    doc.font('Helvetica').fontSize(11).text(
-      `Veuillez émettre à l'ordre de la JIRAMA un chèque de ${formatMontant(totalGeneral)} Ariary en règlement des factures ci-après énumérées.`,
-      { align: 'left' }
-    );
+    doc.font('Helvetica').fontSize(11).text("Veuillez émettre à l'ordre de la JIRAMA un chèque de ", { continued: true });
+    doc.font('Helvetica-Bold').text(`${formatMontant(totalGeneral)} Ariary`, { continued: true });
+    doc.font('Helvetica').text(" en règlement des factures ci-après énumérées.", { align: 'left' });
     doc.moveDown(1.5);
-
-    // ======== Tri par quartier ========
-    const paiementsTries = batch.payments.sort((a, b) => {
-      const q1 = a.compteur.quartier?.toLowerCase() || '';
-      const q2 = b.compteur.quartier?.toLowerCase() || '';
-      return q1.localeCompare(q2);
-    });
 
     // ======== Tableau ========
     let y = doc.y + 10;
@@ -351,9 +489,9 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
     });
     y += 20;
     drawHorizontalLine(y);
-    drawVerticalLines(y - 20, y); // bordures verticales des en-têtes
+    drawVerticalLines(y - 20, y);
 
-    // Contenu du tableau (normal pour les lignes)
+    // Contenu du tableau
     doc.font('Helvetica').fontSize(10);
     let currentQuartier = null;
     let sousTotal = 0;
@@ -363,40 +501,37 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
       const c = p.compteur;
       const quartier = c.quartier || 'Non défini';
 
-      // Affiche un sous-total si on change de quartier
+      // Sous-total si changement de quartier
       if (currentQuartier && currentQuartier !== quartier) {
         y += 4;
         drawHorizontalLine(y);
         y += 4;
-
-        // Sous-total (gras)
         x = startX;
-        for (let i = 0; i < 4; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-        doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[4], align: 'center' });
-        x += colWidths[4];
-        doc.text(formatMontant(sousTotal), x, y, { width: colWidths[5], align: 'center' });
+        for (let i = 0; i < 5; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+        doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
+        x += colWidths[5];
+        doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
 
         y += 16;
         drawHorizontalLine(y);
         drawVerticalLines(yStartQuartier, y);
         yStartQuartier = y;
         sousTotal = 0;
-
-        // Revenir au texte normal pour les lignes suivantes
         doc.font('Helvetica').fontSize(10);
       }
 
       currentQuartier = quartier;
       sousTotal += p.montant || 0;
 
-      // Ligne normale du paiement (texte normal)
+      // Ligne du paiement
       y += 4;
       x = startX;
       const cells = [
+        c.province || 'N/A',
         quartier,
         c.adresse || '-',
         c.rg || '-',
-        c.typeCompteur || '-',
+        p.typeCompteur.join(' / '),
         p.numeroFacture || 'N/A',
         formatMontant(p.montant)
       ];
@@ -411,37 +546,88 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
       drawVerticalLines(y - 20, y);
     }
 
-    // Dernier sous-total du dernier quartier (gras)
+    // Dernier sous-total
     y += 4;
     drawHorizontalLine(y);
     y += 4;
     x = startX;
-    for (let i = 0; i < 4; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-    doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[4], align: 'center' });
-    x += colWidths[4];
-    doc.text(formatMontant(sousTotal), x, y, { width: colWidths[5], align: 'center' });
+    for (let i = 0; i < 5; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+    doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
+    x += colWidths[5];
+    doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
     y += 16;
     drawHorizontalLine(y);
     drawVerticalLines(yStartQuartier, y);
 
-    // Ligne TOTAL GÉNÉRAL (gras)
+    // Total général
     y += 4;
     drawHorizontalLine(y);
     y += 4;
     x = startX;
-    for (let i = 0; i < 4; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-    doc.font('Helvetica-Bold').text('TOTAL GÉNÉRAL', x, y, { width: colWidths[4], align: 'center' });
-    x += colWidths[4];
-    doc.text(formatMontant(totalGeneral), x, y, { width: colWidths[5], align: 'center' });
+    for (let i = 0; i < 5; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
+    doc.font('Helvetica-Bold').text('TOTAL GÉNÉRAL', x, y, { width: colWidths[5], align: 'center' });
+    x += colWidths[5];
+    doc.text(formatMontant(totalGeneral), x, y, { width: colWidths[6], align: 'center' });
     y += 16;
     drawHorizontalLine(y);
     drawVerticalLines(yStartQuartier, y);
 
-    y += 20; // espace après le tableau
-    doc.font('Helvetica-Bold').fontSize(12).text(`Montant Total :`, startX, y, { align: 'left' });
-    y += 30; // espace avant les signatures
+    function montantEnLettres(montant) {
+      const chiffres = [
+        '', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf',
+        'dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize',
+        'dix-sept', 'dix-huit', 'dix-neuf'
+      ];
+      const dizaines = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante', 'soixante', 'quatre-vingt', 'quatre-vingt'];
 
-    // ======== Signatures manuscrites ========
+      function convertirNombre(n) {
+        if (n < 20) return chiffres[n];
+        if (n < 100) {
+          let unite = n % 10;
+          let dizaine = Math.floor(n / 10);
+          let sep = (dizaine === 7 || dizaine === 9) ? '-' : (unite === 1 && dizaine !== 8) ? '-et-' : '-';
+          let base = dizaines[dizaine];
+          if (dizaine === 7 || dizaine === 9) base = dizaines[dizaine] + '-' + chiffres[10 + unite];
+          else if (unite === 0) return base;
+          return base + sep + chiffres[unite];
+        }
+        if (n < 1000) {
+          let reste = n % 100;
+          let centaine = Math.floor(n / 100);
+          let texte = centaine > 1 ? chiffres[centaine] + ' cent' : 'cent';
+          if (reste > 0) texte += ' ' + convertirNombre(reste);
+          return texte;
+        }
+        if (n < 1000000) {
+          let reste = n % 1000;
+          let mille = Math.floor(n / 1000);
+          let texte = mille > 1 ? convertirNombre(mille) + ' mille' : 'mille';
+          if (reste > 0) texte += ' ' + convertirNombre(reste);
+          return texte;
+        }
+        return n.toString(); // Pour les nombres très grands
+      }
+
+      const partieEntiere = Math.floor(montant);
+      const centimes = Math.round((montant - partieEntiere) * 100);
+
+      let result = convertirNombre(partieEntiere) + ' Ariary';
+      if (centimes > 0) result += convertirNombre(centimes);
+
+      return result;
+    }
+
+    // ===== Utilisation dans le PDF =====
+    y += 20;
+    doc.font('Helvetica-Bold').fontSize(12).text(
+      `Montant Total : ${montantEnLettres(totalGeneral)}`,
+      startX,
+      y,
+      { align: 'left' }
+    );
+    y += 30;
+
+    // Signatures
     y += 20;
     const signatures = [
       'Services Etudes et Travaux',
@@ -449,18 +635,11 @@ app.get('/api/payment-batches/:id/pdf', async (req, res) => {
       'Tolotra RANDRIANALAINA',
       'Haingo RAZAFINIAINA'
     ];
-
-    // On élargit l'espace horizontal en utilisant 2 colonnes plus larges
-    const sigColWidth = tableWidth / 2 + 20; // +20 pour plus d'espacement
-
-    // Ligne 1 : deux premières signatures
+    const sigColWidth = tableWidth / 2 + 20;
     doc.font('Helvetica').fontSize(11);
     doc.text(signatures[0], startX, y, { width: sigColWidth, align: 'center' });
     doc.text(signatures[1], startX + sigColWidth + 20, y, { width: sigColWidth, align: 'center' });
-
-    y += 60; // espace pour signature manuscrite
-
-    // Ligne 2 : deux dernières signatures
+    y += 60;
     doc.text(signatures[2], startX, y, { width: sigColWidth, align: 'center' });
     doc.text(signatures[3], startX + sigColWidth + 20, y, { width: sigColWidth, align: 'center' });
 
