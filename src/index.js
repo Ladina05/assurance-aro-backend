@@ -9,6 +9,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const { toWords } = require('number-to-words');
+const { authenticate, requireRole } = require('./middleware/auth');
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -19,7 +20,6 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => {
-    // Ajoutez le type de fichier (cheque/recu) dans le nom pour éviter les conflits
     const fileType = file.fieldname; // 'cheque' ou 'recu'
     cb(null, `batch_${req.params.id}_${fileType}${path.extname(file.originalname)}`);
   }
@@ -33,8 +33,8 @@ app.use(bodyParser());
    🔹 CRUD Compteur + SousCompteur
 ================================= */
 
-// GET compteurs
-app.get('/api/compteurs', async (req, res) => {
+// GET compteurs - Accessible à tous les utilisateurs connectés
+app.get('/api/compteurs', authenticate, async (req, res) => {
   try {
     const loueParam = req.query.loue;
     const where = {};
@@ -53,8 +53,8 @@ app.get('/api/compteurs', async (req, res) => {
   }
 });
 
-// POST compteur
-app.post('/api/compteurs', async (req, res) => {
+// POST compteur - Admin et Inserteur seulement
+app.post('/api/compteurs', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
     const { quartier, localisation, loue, codeImmeuble, nomPropriete, rg, typeBien, province, adresse, sousCompteurs, typeCompteur } = req.body;
     const newC = await prisma.compteur.create({
@@ -84,9 +84,8 @@ app.post('/api/compteurs', async (req, res) => {
   }
 });
 
-// PUT compteur
-// PUT compteur (avec mise à jour des sous-compteurs)
-app.put('/api/compteurs/:id', async (req, res) => {
+// PUT compteur - Admin et Inserteur seulement
+app.put('/api/compteurs/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
     const id = Number(req.params.id);
     const data = req.body;
@@ -140,8 +139,8 @@ app.put('/api/compteurs/:id', async (req, res) => {
   }
 });
 
-// DELETE compteur
-app.delete('/api/compteurs/:id', async (req, res) => {
+// DELETE compteur - Admin seulement
+app.delete('/api/compteurs/:id', authenticate, requireRole(['ADMIN']), async (req, res) => {
   try {
     const id = Number(req.params.id);
     await prisma.sousCompteur.deleteMany({ where: { compteurId: id } });
@@ -157,8 +156,8 @@ app.delete('/api/compteurs/:id', async (req, res) => {
    🔹 CRUD SousCompteurs
 ================================= */
 
-// POST sous-compteur
-app.post('/api/souscompteurs', async (req, res) => {
+// POST sous-compteur - Admin et Inserteur seulement
+app.post('/api/souscompteurs', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
     const { compteurId, numeroCompteur, numeroFacture, montant } = req.body;
     const newSous = await prisma.sousCompteur.create({
@@ -170,8 +169,8 @@ app.post('/api/souscompteurs', async (req, res) => {
   }
 });
 
-// PUT sous-compteur
-app.put('/api/souscompteurs/:id', async (req, res) => {
+// PUT sous-compteur - Admin et Inserteur seulement
+app.put('/api/souscompteurs/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
     const id = Number(req.params.id);
     const { numeroFacture, montant } = req.body;
@@ -186,8 +185,12 @@ app.put('/api/souscompteurs/:id', async (req, res) => {
   }
 });
 
-// Upload / Update PDF du chèque
-app.post('/api/payment-batches/:id/cheque', upload.single('cheque'), async (req, res) => {
+/* ===============================
+   🔹 Gestion des fichiers (Chèques et Reçus)
+================================= */
+
+// Upload / Update PDF du chèque - Admin et Inserteur seulement
+app.post('/api/payment-batches/:id/cheque', authenticate, requireRole(['ADMIN', 'INSERTEUR']), upload.single('cheque'), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!req.file) return res.status(400).json({ message: "Fichier manquant" });
@@ -203,8 +206,8 @@ app.post('/api/payment-batches/:id/cheque', upload.single('cheque'), async (req,
   }
 });
 
-// Télécharger le PDF du chèque
-app.get('/api/payment-batches/:id/cheque', async (req, res) => {
+// Télécharger le PDF du chèque - Tous les utilisateurs connectés
+app.get('/api/payment-batches/:id/cheque', authenticate, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({ where: { id } });
@@ -218,8 +221,8 @@ app.get('/api/payment-batches/:id/cheque', async (req, res) => {
   }
 });
 
-// Supprimer le PDF du chèque
-app.delete('/api/payment-batches/:id/cheque', async (req, res) => {
+// Supprimer le PDF du chèque - Admin seulement
+app.delete('/api/payment-batches/:id/cheque', authenticate, requireRole(['ADMIN']), async (req, res) => {
   try {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({ where: { id } });
@@ -236,8 +239,8 @@ app.delete('/api/payment-batches/:id/cheque', async (req, res) => {
   }
 });
 
-// Upload / Update PDF du reçu
-app.post('/api/payment-batches/:id/recu', upload.single('recu'), async (req, res) => {
+// Upload / Update PDF du reçu - Admin et Inserteur seulement
+app.post('/api/payment-batches/:id/recu', authenticate, requireRole(['ADMIN', 'INSERTEUR']), upload.single('recu'), async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!req.file) return res.status(400).json({ message: "Fichier manquant" });
@@ -253,8 +256,8 @@ app.post('/api/payment-batches/:id/recu', upload.single('recu'), async (req, res
   }
 });
 
-// Télécharger le PDF du reçu
-app.get('/api/payment-batches/:id/recu', async (req, res) => {
+// Télécharger le PDF du reçu - Tous les utilisateurs connectés
+app.get('/api/payment-batches/:id/recu', authenticate, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({ where: { id } });
@@ -268,8 +271,8 @@ app.get('/api/payment-batches/:id/recu', async (req, res) => {
   }
 });
 
-// Supprimer le PDF du reçu
-app.delete('/api/payment-batches/:id/recu', async (req, res) => {
+// Supprimer le PDF du reçu - Admin seulement
+app.delete('/api/payment-batches/:id/recu', authenticate, requireRole(['ADMIN']), async (req, res) => {
   try {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({ where: { id } });
@@ -290,8 +293,8 @@ app.delete('/api/payment-batches/:id/recu', async (req, res) => {
    🔹 Paiement / Historique / PDF
 ================================= */
 
-// POST paiement batch
-app.post('/api/payment-batches', async (req, res) => {
+// POST paiement batch - Admin et Inserteur seulement
+app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
     const compteurs = await prisma.compteur.findMany({
       where: { loue: false },
@@ -299,7 +302,7 @@ app.post('/api/payment-batches', async (req, res) => {
     });
 
     const sousCompteurs = compteurs
-      .flatMap(c => c.sousCompteurs.map(s => ({ ...s, compteur: c }))) // ✅ on attache le compteur à chaque sous-compteur
+      .flatMap(c => c.sousCompteurs.map(s => ({ ...s, compteur: c })))
       .filter(s => s.montant != null && !isNaN(s.montant) && parseFloat(s.montant) > 0);
 
     if (!sousCompteurs.length)
@@ -338,19 +341,18 @@ app.post('/api/payment-batches', async (req, res) => {
   }
 });
 
-// GET batches
-app.get('/api/payment-batches', async (req, res) => {
+// GET batches - Tous les utilisateurs connectés
+app.get('/api/payment-batches', authenticate, async (req, res) => {
   try {
     const batches = await prisma.paymentBatch.findMany({ orderBy: { date: 'desc' } });
-    // Prisma renvoie déjà des Float si le champ total est Float
     res.json(batches);
   } catch (err) {
     res.status(500).json({ message: 'Erreur récupération historique' });
   }
 });
 
-// GET batch details
-app.get('/api/payment-batches/:id', async (req, res) => {
+// GET batch details - Tous les utilisateurs connectés
+app.get('/api/payment-batches/:id', authenticate, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({
@@ -360,7 +362,6 @@ app.get('/api/payment-batches/:id', async (req, res) => {
 
     if (!batch) return res.status(404).json({ message: 'Batch non trouvé' });
 
-    // Assurer que les montants sont bien des Float
     const paymentsWithFloat = batch.payments.map(p => ({
       ...p,
       montant: parseFloat(p.montant)
@@ -372,15 +373,13 @@ app.get('/api/payment-batches/:id', async (req, res) => {
   }
 });
 
-// DELETE batch
-app.delete('/api/payment-batches/:id', async (req, res) => {
+// DELETE batch - Admin seulement
+app.delete('/api/payment-batches/:id', authenticate, requireRole(['ADMIN']), async (req, res) => {
   try {
     const id = Number(req.params.id);
 
     await prisma.$transaction(async (tx) => {
-      // Supprimer tous les paiements associés
       await tx.payment.deleteMany({ where: { batchId: id } });
-      // Supprimer le batch
       await tx.paymentBatch.delete({ where: { id } });
     });
 
@@ -391,8 +390,8 @@ app.delete('/api/payment-batches/:id', async (req, res) => {
   }
 });
 
-// GET batch PDF structuré et corrigé
-app.get('/api/payment-batches/:id/pdf', async (req, res) => {
+// GET batch PDF - Tous les utilisateurs connectés
+app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({
