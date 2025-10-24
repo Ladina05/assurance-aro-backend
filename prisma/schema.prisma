@@ -16,7 +16,21 @@ model User {
   isActive  Boolean  @default(false)
   createdAt DateTime @default(now())
   
+  passwordResetTokens PasswordResetToken[]
+  
   @@map("users")
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("password_reset_tokens")
 }
 
 enum UserRole {
