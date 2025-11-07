@@ -8,13 +8,14 @@ datasource db {
 }
 
 model User {
-  id        Int      @id @default(autoincrement())
-  name      String
-  email     String   @unique
-  password  String
-  role      UserRole @default(PENDING)
-  isActive  Boolean  @default(false)
-  createdAt DateTime @default(now())
+  id              Int      @id @default(autoincrement())
+  name            String
+  email           String   @unique
+  password        String
+  profilePicture  String?  // Nouveau champ pour la photo de profil
+  role            UserRole @default(PENDING)
+  isActive        Boolean  @default(false)
+  createdAt       DateTime @default(now())
   
   passwordResetTokens PasswordResetToken[]
   

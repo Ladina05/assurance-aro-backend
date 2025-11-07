@@ -82,6 +82,7 @@ router.post('/login', async (req, res) => {
         id: user.id,
         name: user.name,
         email: user.email,
+        profilePicture: user.profilePicture,
         role: user.role
       }
     });
@@ -248,6 +249,7 @@ router.get('/profile', async (req, res) => {
         name: true,
         email: true,
         role: true,
+        profilePicture: true,
         isActive: true,
         createdAt: true
       },
@@ -256,6 +258,77 @@ router.get('/profile', async (req, res) => {
     res.json(user);
   } catch (err) {
     res.status(401).json({ message: 'Token invalide' });
+  }
+});
+
+// ✅ Route pour uploader/modifier la photo de profil
+router.put('/profile-picture', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ message: 'Non autorisé' });
+
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const { profilePicture } = req.body;
+
+    if (!profilePicture) {
+      return res.status(400).json({ message: 'Photo de profil requise' });
+    }
+
+    const updatedUser = await prisma.user.update({
+      where: { id: decoded.userId },
+      data: { profilePicture },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        profilePicture: true,
+        isActive: true,
+        createdAt: true
+      },
+    });
+
+    res.json({
+      message: 'Photo de profil mise à jour avec succès',
+      user: updatedUser
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Erreur serveur', detail: err.message });
+  }
+});
+
+// ✅ Route pour supprimer la photo de profil
+router.delete('/profile-picture', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).json({ message: 'Non autorisé' });
+
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+
+    const updatedUser = await prisma.user.update({
+      where: { id: decoded.userId },
+      data: { profilePicture: null },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        profilePicture: true,
+        isActive: true,
+        createdAt: true
+      },
+    });
+
+    res.json({
+      message: 'Photo de profil supprimée avec succès',
+      user: updatedUser
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Erreur serveur', detail: err.message });
   }
 });
 

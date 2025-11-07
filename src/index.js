@@ -26,7 +26,14 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-app.use(cors({ origin: 'http://localhost:5173' }));
+// Augmenter la limite de taille pour les images base64
+app.use(express.json({ limit: '10mb' })); // Augmentez à 10MB
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
 app.use(bodyParser());
 
 /* ===============================
@@ -721,6 +728,472 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     res.status(500).json({ message: 'Erreur PDF', detail: err.message });
   }
 });
+
+/* ===============================
+   🔹 Statistiques d'évolution des paiements
+================================= */
+
+// GET statistiques d'évolution par compteur et année
+app.get('/api/statistiques/evolution', authenticate, async (req, res) => {
+  try {
+    const { rg, annee } = req.query;
+
+    if (!rg || !annee) {
+      return res.status(400).json({
+        message: 'Le RG du compteur et l\'année sont requis'
+      });
+    }
+
+    // Vérifier que le compteur existe
+    const compteur = await prisma.compteur.findFirst({
+      where: { rg: rg.toString() }
+    });
+
+    if (!compteur) {
+      return res.status(404).json({
+        message: 'Compteur non trouvé avec ce RG'
+      });
+    }
+
+    // Récupérer tous les paiements pour ce compteur sur l'année demandée
+    const paiements = await prisma.payment.findMany({
+      where: {
+        compteurId: compteur.id,
+        batch: {
+          anneePaiement: parseInt(annee)
+        }
+      },
+      include: {
+        batch: true
+      }
+    });
+
+    // Grouper par mois et calculer les sommes
+    const statistiquesMois = {};
+
+    // Initialiser tous les mois de l'année
+    for (let mois = 1; mois <= 12; mois++) {
+      statistiquesMois[mois] = {
+        mois: mois,
+        nomMois: new Date(parseInt(annee), mois - 1, 1).toLocaleString('fr-FR', { month: 'long' }),
+        montant: 0
+      };
+    }
+
+    // Calculer les montants par mois
+    paiements.forEach(paiement => {
+      const mois = paiement.batch.moisPaiement;
+      if (mois >= 1 && mois <= 12) {
+        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+      }
+    });
+
+    // Convertir en tableau et formater
+    const resultat = Object.values(statistiquesMois).map(item => ({
+      mois: item.mois,
+      nomMois: item.nomMois.charAt(0).toUpperCase() + item.nomMois.slice(1),
+      montant: parseFloat(item.montant.toFixed(2))
+    }));
+
+    res.json({
+      compteur: {
+        id: compteur.id,
+        rg: compteur.rg,
+        quartier: compteur.quartier,
+        localisation: compteur.localisation,
+        nomPropriete: compteur.nomPropriete
+      },
+      annee: parseInt(annee),
+      statistiques: resultat,
+      totalAnnuel: parseFloat(resultat.reduce((sum, item) => sum + item.montant, 0).toFixed(2))
+    });
+
+  } catch (err) {
+    console.error('Erreur statistiques évolution:', err);
+    res.status(500).json({
+      message: 'Erreur lors du calcul des statistiques',
+      detail: err.message
+    });
+  }
+});
+
+/* ===============================
+   🔹 Statistiques générales des paiements
+================================= */
+
+// GET statistiques générales par année
+app.get('/api/statistiques/general', authenticate, async (req, res) => {
+  try {
+    const { annee } = req.query;
+    const anneeCourante = annee ? parseInt(annee) : new Date().getFullYear();
+
+    // Récupérer tous les paiements de l'année
+    const paiements = await prisma.payment.findMany({
+      where: {
+        batch: {
+          anneePaiement: anneeCourante
+        }
+      },
+      include: {
+        batch: true
+      }
+    });
+
+    // Grouper par mois et calculer les sommes
+    const statistiquesMois = {};
+
+    // Initialiser tous les mois de l'année
+    for (let mois = 1; mois <= 12; mois++) {
+      statistiquesMois[mois] = {
+        mois: mois,
+        nomMois: new Date(anneeCourante, mois - 1, 1).toLocaleString('fr-FR', { month: 'long' }),
+        montant: 0,
+        nombrePaiements: 0
+      };
+    }
+
+    // Calculer les montants par mois
+    paiements.forEach(paiement => {
+      const mois = paiement.batch.moisPaiement;
+      if (mois >= 1 && mois <= 12) {
+        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+        statistiquesMois[mois].nombrePaiements += 1;
+      }
+    });
+
+    // Convertir en tableau et formater
+    const resultat = Object.values(statistiquesMois).map(item => ({
+      mois: item.mois,
+      nomMois: item.nomMois.charAt(0).toUpperCase() + item.nomMois.slice(1),
+      montant: parseFloat(item.montant.toFixed(2)),
+      nombrePaiements: item.nombrePaiements
+    }));
+
+    // Calculer les totaux
+    const totalAnnuel = parseFloat(resultat.reduce((sum, item) => sum + item.montant, 0).toFixed(2));
+    const totalPaiements = resultat.reduce((sum, item) => sum + item.nombrePaiements, 0);
+
+    res.json({
+      annee: anneeCourante,
+      statistiques: resultat,
+      totalAnnuel: totalAnnuel,
+      totalPaiements: totalPaiements,
+      moyenneMensuelle: parseFloat((totalAnnuel / 12).toFixed(2))
+    });
+
+  } catch (err) {
+    console.error('Erreur statistiques générales:', err);
+    res.status(500).json({
+      message: 'Erreur lors du calcul des statistiques générales',
+      detail: err.message
+    });
+  }
+});
+
+/* ===============================
+   🔹 Export Excel et PDF pour l'évolution
+================================= */
+
+const ExcelJS = require('exceljs');
+
+// GET export Excel pour l'évolution
+app.get('/api/statistiques/evolution/export-excel', authenticate, async (req, res) => {
+  try {
+    const { rg, annee } = req.query;
+
+    if (!rg || !annee) {
+      return res.status(400).json({
+        message: 'Le RG du compteur et l\'année sont requis'
+      });
+    }
+
+    // Récupérer les données (même logique que la route statistiques/evolution)
+    const compteur = await prisma.compteur.findFirst({
+      where: { rg: rg.toString() }
+    });
+
+    if (!compteur) {
+      return res.status(404).json({
+        message: 'Compteur non trouvé avec ce RG'
+      });
+    }
+
+    const paiements = await prisma.payment.findMany({
+      where: {
+        compteurId: compteur.id,
+        batch: {
+          anneePaiement: parseInt(annee)
+        }
+      },
+      include: {
+        batch: true
+      }
+    });
+
+    // Calculer les statistiques par mois
+    const statistiquesMois = {};
+    for (let mois = 1; mois <= 12; mois++) {
+      statistiquesMois[mois] = {
+        mois: mois,
+        nomMois: new Date(parseInt(annee), mois - 1, 1).toLocaleString('fr-FR', { month: 'long' }),
+        montant: 0
+      };
+    }
+
+    paiements.forEach(paiement => {
+      const mois = paiement.batch.moisPaiement;
+      if (mois >= 1 && mois <= 12) {
+        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+      }
+    });
+
+    const resultat = Object.values(statistiquesMois).map(item => ({
+      mois: item.mois,
+      nomMois: item.nomMois.charAt(0).toUpperCase() + item.nomMois.slice(1),
+      montant: parseFloat(item.montant.toFixed(2))
+    }));
+
+    const totalAnnuel = parseFloat(resultat.reduce((sum, item) => sum + item.montant, 0).toFixed(2));
+
+    // Créer le workbook Excel
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Évolution des paiements');
+
+    // Titre du fichier
+    const titre = `Évolution des paiements - ${compteur.quartier} - ${compteur.nomPropriete} - RG: ${compteur.rg} - Année: ${annee}`;
+
+    // Ajouter le titre
+    worksheet.mergeCells('A1:B1');
+    worksheet.getCell('A1').value = titre;
+    worksheet.getCell('A1').font = { bold: true, size: 14 };
+    worksheet.getCell('A1').alignment = { horizontal: 'center', vertical: 'middle' };
+
+    // En-têtes du tableau
+    worksheet.addRow(['Mois', 'Montant payé (Ar)']);
+
+    // Style des en-têtes
+    const headerRow = worksheet.getRow(2);
+    headerRow.font = { bold: true };
+    headerRow.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE8F5E8' }
+    };
+
+    // Données
+    resultat.forEach(stat => {
+      worksheet.addRow([stat.nomMois, stat.montant]);
+    });
+
+    // Total annuel
+    worksheet.addRow(['TOTAL ANNÉE', totalAnnuel]);
+    const totalRow = worksheet.getRow(resultat.length + 3);
+    totalRow.font = { bold: true };
+    totalRow.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFD4EDDA' }
+    };
+
+    // Style des colonnes
+    worksheet.columns = [
+      { width: 20 },
+      { width: 25 }
+    ];
+
+    // Générer le fichier
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=evolution_paiements_${compteur.rg}_${annee}.xlsx`);
+
+    await workbook.xlsx.write(res);
+    res.end();
+
+  } catch (err) {
+    console.error('Erreur export Excel:', err);
+    res.status(500).json({
+      message: 'Erreur lors de l\'export Excel',
+      detail: err.message
+    });
+  }
+});
+
+// GET export PDF pour l'évolution
+app.get('/api/statistiques/evolution/export-pdf', authenticate, async (req, res) => {
+  try {
+    const { rg, annee } = req.query;
+
+    if (!rg || !annee) {
+      return res.status(400).json({
+        message: 'Le RG du compteur et l\'année sont requis'
+      });
+    }
+
+    // Récupérer les données (même logique que la route statistiques/evolution)
+    const compteur = await prisma.compteur.findFirst({
+      where: { rg: rg.toString() }
+    });
+
+    if (!compteur) {
+      return res.status(404).json({
+        message: 'Compteur non trouvé avec ce RG'
+      });
+    }
+
+    const paiements = await prisma.payment.findMany({
+      where: {
+        compteurId: compteur.id,
+        batch: {
+          anneePaiement: parseInt(annee)
+        }
+      },
+      include: {
+        batch: true
+      }
+    });
+
+    // Calculer les statistiques par mois
+    const statistiquesMois = {};
+    for (let mois = 1; mois <= 12; mois++) {
+      statistiquesMois[mois] = {
+        mois: mois,
+        nomMois: new Date(parseInt(annee), mois - 1, 1).toLocaleString('fr-FR', { month: 'long' }),
+        montant: 0
+      };
+    }
+
+    paiements.forEach(paiement => {
+      const mois = paiement.batch.moisPaiement;
+      if (mois >= 1 && mois <= 12) {
+        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+      }
+    });
+
+    const resultat = Object.values(statistiquesMois).map(item => ({
+      mois: item.mois,
+      nomMois: item.nomMois.charAt(0).toUpperCase() + item.nomMois.slice(1),
+      montant: parseFloat(item.montant.toFixed(2))
+    }));
+
+    const totalAnnuel = parseFloat(resultat.reduce((sum, item) => sum + item.montant, 0).toFixed(2));
+
+    // Créer le PDF
+    const doc = new PDFDocument({ margin: 40 });
+
+    // En-tête du fichier
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename=evolution_paiements_${compteur.rg}_${annee}.pdf`);
+
+    doc.pipe(res);
+
+    // Titre
+    const titre = `Évolution des paiements - Année ${annee}`;
+    const sousTitre = `${compteur.quartier} - ${compteur.nomPropriete} - RG: ${compteur.rg}`;
+
+    doc.fontSize(18).font('Helvetica-Bold').text(titre, { align: 'center' });
+    doc.moveDown(0.5);
+    doc.fontSize(12).font('Helvetica').text(sousTitre, { align: 'center' });
+    doc.moveDown(1);
+
+    // Configuration du tableau
+    const startX = 50;
+    const colWidths = [200, 150];
+    const tableWidth = colWidths.reduce((a, b) => a + b, 0);
+    const rowHeight = 25;
+    const headerHeight = 30;
+
+    // Position de départ du tableau
+    let yPosition = doc.y;
+
+    // Dessiner le cadre du tableau
+    doc.rect(startX, yPosition, tableWidth, headerHeight).stroke();
+    doc.rect(startX, yPosition + headerHeight, tableWidth, rowHeight * (resultat.length + 1)).stroke();
+
+    // En-têtes du tableau avec fond coloré
+    doc.rect(startX, yPosition, colWidths[0], headerHeight).fillAndStroke('#f8f9fa', '#000');
+    doc.rect(startX + colWidths[0], yPosition, colWidths[1], headerHeight).fillAndStroke('#f8f9fa', '#000');
+
+    doc.fontSize(10).font('Helvetica-Bold');
+    doc.fillColor('#000');
+    doc.text('Mois', startX + 10, yPosition + 10, { width: colWidths[0] - 20, align: 'left' });
+    doc.text('Montant payé (Ar)', startX + colWidths[0] + 10, yPosition + 10, { width: colWidths[1] - 20, align: 'right' });
+
+    yPosition += headerHeight;
+
+    // Données du tableau
+    doc.fontSize(10).font('Helvetica');
+
+    resultat.forEach((stat, index) => {
+      // Ligne de séparation horizontale
+      doc.moveTo(startX, yPosition).lineTo(startX + tableWidth, yPosition).stroke();
+
+      // Ligne de séparation verticale
+      doc.moveTo(startX + colWidths[0], yPosition).lineTo(startX + colWidths[0], yPosition + rowHeight).stroke();
+
+      // Contenu des cellules
+      doc.text(stat.nomMois, startX + 10, yPosition + 8, {
+        width: colWidths[0] - 20,
+        align: 'left'
+      });
+
+      doc.text(formatMontantFR(stat.montant), startX + colWidths[0] + 10, yPosition + 8, {
+        width: colWidths[1] - 20,
+        align: 'right'
+      });
+
+      yPosition += rowHeight;
+    });
+
+    // Ligne de séparation avant le total
+    doc.moveTo(startX, yPosition).lineTo(startX + tableWidth, yPosition).stroke();
+
+    // Cellule du total
+    doc.rect(startX, yPosition, colWidths[0], rowHeight).fillAndStroke('#e8f5e8', '#000');
+    doc.rect(startX + colWidths[0], yPosition, colWidths[1], rowHeight).fillAndStroke('#e8f5e8', '#000');
+
+    doc.fontSize(11).font('Helvetica-Bold');
+    doc.text('TOTAL ANNÉE', startX + 10, yPosition + 8, {
+      width: colWidths[0] - 20,
+      align: 'left'
+    });
+
+    doc.text(formatMontantFR(totalAnnuel), startX + colWidths[0] + 10, yPosition + 8, {
+      width: colWidths[1] - 20,
+      align: 'right'
+    });
+
+    // Dernière ligne de séparation
+    doc.moveTo(startX, yPosition + rowHeight).lineTo(startX + tableWidth, yPosition + rowHeight).stroke();
+
+    doc.end();
+
+  } catch (err) {
+    console.error('Erreur export PDF:', err);
+    res.status(500).json({
+      message: 'Erreur lors de l\'export PDF',
+      detail: err.message
+    });
+  }
+});
+
+// Fonction utilitaire pour formater les montants (identique à celle existante)
+function formatMontantFR(montant) {
+  if (montant == null) return "-";
+  return montant.toLocaleString('fr-FR', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+    useGrouping: true
+  }).replace(/\u202F/g, ' ') + " Ar";
+}
+
+// Fonction utilitaire pour formater les montants (identique à celle existante)
+function formatMontantFR(montant) {
+  if (montant == null) return "-";
+  return montant.toLocaleString('fr-FR', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+    useGrouping: true
+  }).replace(/\u202F/g, ' ') + " Ar";
+}
 
 app.use('/api/auth', authRoutes);
 
