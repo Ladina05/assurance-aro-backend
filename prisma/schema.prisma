@@ -73,6 +73,8 @@ model PaymentBatch {
   payments  Payment[]
   chequePdf String?
   recuPdf String?
+  moisPaiement Int?   // Nouveau champ: mois du paiement (1-12)
+  anneePaiement Int?  // Nouveau champ: année du paiement
 }
 
 model Payment {

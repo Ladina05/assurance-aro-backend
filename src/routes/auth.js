@@ -5,7 +5,6 @@ const jwt = require('jsonwebtoken');
 const prisma = require('../prismaClient');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
-
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_key';
 const PASSWORD_RESET_EXPIRY = parseInt(process.env.PASSWORD_RESET_TOKEN_EXPIRY) || 3600000;
 
@@ -29,12 +28,12 @@ router.post('/register', async (req, res) => {
     if (existing) return res.status(400).json({ message: 'Email déjà utilisé' });
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    
+
     // Créer l'utilisateur avec statut en attente
     const newUser = await prisma.user.create({
-      data: { 
-        name, 
-        email, 
+      data: {
+        name,
+        email,
         password: hashedPassword,
         role: 'PENDING',
         isActive: false
@@ -44,7 +43,7 @@ router.post('/register', async (req, res) => {
     // Envoyer email à l'admin pour approbation
     await sendApprovalEmailToAdmin(newUser);
 
-    res.status(201).json({ 
+    res.status(201).json({
       message: 'Inscription réussie ! Votre compte est en attente d\'approbation par l\'administrateur.',
       user: { id: newUser.id, name: newUser.name, email: newUser.email }
     });
@@ -64,27 +63,27 @@ router.post('/login', async (req, res) => {
 
     // Vérifier si le compte est actif
     if (!user.isActive) {
-      return res.status(401).json({ 
-        message: 'Votre compte est en attente d\'approbation par l\'administrateur.' 
+      return res.status(401).json({
+        message: 'Votre compte est en attente d\'approbation par l\'administrateur.'
       });
     }
 
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ message: 'Mot de passe incorrect' });
 
-    const token = jwt.sign({ 
-      userId: user.id, 
-      role: user.role 
+    const token = jwt.sign({
+      userId: user.id,
+      role: user.role
     }, JWT_SECRET, { expiresIn: '1d' });
 
-    res.json({ 
-      token, 
-      user: { 
-        id: user.id, 
-        name: user.name, 
-        email: user.email, 
-        role: user.role 
-      } 
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role
+      }
     });
   } catch (err) {
     console.error(err);
@@ -119,7 +118,7 @@ router.post('/approve-user', async (req, res) => {
     // Mettre à jour l'utilisateur
     const updatedUser = await prisma.user.update({
       where: { id: parseInt(userId) },
-      data: { 
+      data: {
         role: role,
         isActive: true
       }
@@ -128,9 +127,9 @@ router.post('/approve-user', async (req, res) => {
     // Envoyer un email de confirmation à l'utilisateur
     await sendApprovalConfirmationEmail(updatedUser);
 
-    res.json({ 
+    res.json({
       message: `Utilisateur approuvé avec succès en tant que ${role}`,
-      user: updatedUser 
+      user: updatedUser
     });
   } catch (err) {
     console.error(err);
@@ -157,7 +156,7 @@ router.get('/pending-users', async (req, res) => {
     }
 
     const pendingUsers = await prisma.user.findMany({
-      where: { 
+      where: {
         isActive: false,
         role: 'PENDING'
       },
@@ -188,7 +187,7 @@ router.get('/approve-user', async (req, res) => {
     // Mettre à jour l'utilisateur
     const updatedUser = await prisma.user.update({
       where: { id: parseInt(userId) },
-      data: { 
+      data: {
         role: role,
         isActive: true
       }
@@ -244,13 +243,13 @@ router.get('/profile', async (req, res) => {
 
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
-      select: { 
-        id: true, 
-        name: true, 
-        email: true, 
+      select: {
+        id: true,
+        name: true,
+        email: true,
         role: true,
         isActive: true,
-        createdAt: true 
+        createdAt: true
       },
     });
 
@@ -270,7 +269,7 @@ router.put('/change-password', async (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     const { oldPassword, newPassword } = req.body;
 
-    if (!oldPassword || !newPassword) 
+    if (!oldPassword || !newPassword)
       return res.status(400).json({ message: 'Champs manquants' });
 
     const user = await prisma.user.findUnique({ where: { id: decoded.userId } });
@@ -295,9 +294,9 @@ router.put('/change-password', async (req, res) => {
 // Fonction pour envoyer l'email d'approbation à l'admin
 async function sendApprovalEmailToAdmin(user) {
   const adminEmail = process.env.ADMIN_EMAIL || process.env.EMAIL_USER;
-  
+
   const approvalUrl = `${process.env.API_URL || 'http://localhost:4000/api'}/auth/approve-user`;
-  
+
   const mailOptions = {
     from: process.env.EMAIL_USER,
     to: adminEmail,
@@ -397,22 +396,22 @@ router.post('/forgot-password', async (req, res) => {
 
     // Ne pas révéler si l'email existe ou non pour des raisons de sécurité
     if (!user) {
-      return res.json({ 
-        message: 'Si un compte avec cet email existe, un lien de réinitialisation a été envoyé.' 
+      return res.json({
+        message: 'Si un compte avec cet email existe, un lien de réinitialisation a été envoyé.'
       });
     }
 
     // Vérifier si l'utilisateur est actif
     if (!user.isActive) {
-      return res.status(400).json({ 
-        message: 'Votre compte est en attente d\'approbation. Contactez l\'administrateur.' 
+      return res.status(400).json({
+        message: 'Votre compte est en attente d\'approbation. Contactez l\'administrateur.'
       });
     }
 
     // CORRECTION : Utiliser crypto correctement
     const resetToken = crypto.randomBytes(32).toString('hex');
     const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
-    
+
     // Date d'expiration (1 heure)
     const expiresAt = new Date(Date.now() + PASSWORD_RESET_EXPIRY);
 
@@ -433,8 +432,8 @@ router.post('/forgot-password', async (req, res) => {
     // Envoyer l'email de réinitialisation
     await sendPasswordResetEmail(user, resetToken);
 
-    res.json({ 
-      message: 'Si un compte avec cet email existe, un lien de réinitialisation a été envoyé.' 
+    res.json({
+      message: 'Si un compte avec cet email existe, un lien de réinitialisation a été envoyé.'
     });
 
   } catch (err) {
@@ -501,7 +500,7 @@ router.post('/reset-password', async (req, res) => {
 
       // Supprimer tous les autres tokens de l'utilisateur
       await tx.passwordResetToken.deleteMany({
-        where: { 
+        where: {
           userId: resetToken.userId,
           id: { not: resetToken.id }
         }
@@ -554,10 +553,10 @@ router.get('/verify-reset-token/:token', async (req, res) => {
       return res.status(400).json({ valid: false, message: 'Compte inactif' });
     }
 
-    res.json({ 
-      valid: true, 
+    res.json({
+      valid: true,
       message: 'Token valide',
-      email: resetToken.user.email 
+      email: resetToken.user.email
     });
 
   } catch (err) {

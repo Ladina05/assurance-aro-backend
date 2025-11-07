@@ -296,6 +296,8 @@ app.delete('/api/payment-batches/:id/recu', authenticate, requireRole(['ADMIN'])
 // POST paiement batch - Admin et Inserteur seulement
 app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
+    const { moisPaiement, anneePaiement } = req.body; // Récupérer le mois et l'année depuis le frontend
+
     const compteurs = await prisma.compteur.findMany({
       where: { loue: false },
       include: { sousCompteurs: true }
@@ -311,7 +313,13 @@ app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR'
     const total = sousCompteurs.reduce((sum, s) => sum + parseFloat(s.montant), 0);
 
     const batch = await prisma.$transaction(async (tx) => {
-      const newBatch = await tx.paymentBatch.create({ data: { total } });
+      const newBatch = await tx.paymentBatch.create({
+        data: {
+          total,
+          moisPaiement: moisPaiement || new Date().getMonth() + 1, // Défaut: mois actuel
+          anneePaiement: anneePaiement || new Date().getFullYear() // Défaut: année actuelle
+        }
+      });
 
       for (const s of sousCompteurs) {
         await tx.payment.create({
@@ -407,7 +415,7 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
 
     const startX = 15;
     const colWidths = [80, 80, 80, 70, 70, 90, 90];
-    const headers = ['Province', 'Quartier', 'Adresse', 'RG','Type', 'N° Facture', 'Montant (Ar)'];
+    const headers = ['Province', 'Quartier', 'Adresse', 'RG', 'Type', 'N° Facture', 'Montant (Ar)'];
     const tableWidth = colWidths.reduce((a, b) => a + b, 0);
 
     function formatMontant(valeur) {
@@ -438,7 +446,7 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       (batch.payments ?? []).reduce((acc, p) => {
         const key = p.numeroFacture ?? `nofacture-${p.id}`;
         if (!acc[key]) {
-          acc[key] = { 
+          acc[key] = {
             ...p,
             typeCompteur: [p.typeCompteur],
             numeroCompteur: [p.numeroCompteur],
@@ -465,10 +473,18 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     const dateBatch = new Date(batch.date);
     const mois = dateBatch.toLocaleString('fr-FR', { month: 'long' });
     const annee = dateBatch.getFullYear();
+    const moisPaiement = batch.moisPaiement || new Date(batch.date).getMonth() + 1;
+    const anneePaiement = batch.anneePaiement || new Date(batch.date).getFullYear();
+
+    const nomsMois = [
+      'janvier', 'février', 'mars', 'avril', 'mai', 'juin',
+      'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'
+    ];
+    const nomMois = nomsMois[moisPaiement - 1];
 
     doc.fontSize(14).font('Helvetica-Bold').text('Note: Département comptabilité Générales ARO', { align: 'center' });
     doc.moveDown(0.3);
-    doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${mois.toUpperCase()} ${annee}`, { align: 'center' });
+    doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${nomMois.toUpperCase()} ${anneePaiement}`, { align: 'center' });
     doc.moveDown(0.5);
     doc.font('Helvetica').fontSize(11).text("Veuillez émettre à l'ordre de la JIRAMA un chèque de ", { continued: true });
     doc.font('Helvetica-Bold').text(`${formatMontant(totalGeneral)} Ariary`, { continued: true });
@@ -580,40 +596,96 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       const dizaines = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante', 'soixante', 'quatre-vingt', 'quatre-vingt'];
 
       function convertirNombre(n) {
+        if (n === 0) return 'zéro';
         if (n < 20) return chiffres[n];
         if (n < 100) {
           let unite = n % 10;
           let dizaine = Math.floor(n / 10);
-          let sep = (dizaine === 7 || dizaine === 9) ? '-' : (unite === 1 && dizaine !== 8) ? '-et-' : '-';
-          let base = dizaines[dizaine];
-          if (dizaine === 7 || dizaine === 9) base = dizaines[dizaine] + '-' + chiffres[10 + unite];
-          else if (unite === 0) return base;
-          return base + sep + chiffres[unite];
+
+          // Cas particuliers pour 70, 80, 90
+          if ((dizaine === 7 || dizaine === 9) && unite === 0) {
+            return dizaines[dizaine];
+          }
+          if (dizaine === 8 && unite === 0) {
+            return dizaines[dizaine] + 's'; // "quatre-vingts"
+          }
+          if (dizaine === 7 || dizaine === 9) {
+            return dizaines[dizaine] + '-' + chiffres[10 + unite];
+          }
+
+          // Cas généraux
+          let sep = (unite === 1 && dizaine !== 8) ? '-et-' : '-';
+          if (unite === 0) return dizaines[dizaine];
+          return dizaines[dizaine] + sep + chiffres[unite];
         }
         if (n < 1000) {
           let reste = n % 100;
           let centaine = Math.floor(n / 100);
-          let texte = centaine > 1 ? chiffres[centaine] + ' cent' : 'cent';
-          if (reste > 0) texte += ' ' + convertirNombre(reste);
+          let texte = '';
+
+          if (centaine > 1) {
+            texte = chiffres[centaine] + ' cent';
+            if (reste === 0) texte += 's'; // "deux cents"
+          } else {
+            texte = 'cent';
+          }
+
+          if (reste > 0) {
+            texte += ' ' + convertirNombre(reste);
+          }
           return texte;
         }
-        if (n < 1000000) {
-          let reste = n % 1000;
-          let mille = Math.floor(n / 1000);
-          let texte = mille > 1 ? convertirNombre(mille) + ' mille' : 'mille';
-          if (reste > 0) texte += ' ' + convertirNombre(reste);
-          return texte;
+
+        // Fonction récursive pour les grands nombres
+        const echelles = [
+          { valeur: 1000000000000, nom: 'billion', pluriel: 'billions' },
+          { valeur: 1000000000, nom: 'milliard', pluriel: 'milliards' },
+          { valeur: 1000000, nom: 'million', pluriel: 'millions' },
+          { valeur: 1000, nom: 'mille', pluriel: 'mille' }
+        ];
+
+        for (let echelle of echelles) {
+          if (n >= echelle.valeur) {
+            let quotient = Math.floor(n / echelle.valeur);
+            let reste = n % echelle.valeur;
+
+            let texte = '';
+            if (quotient > 1) {
+              texte = convertirNombre(quotient) + ' ' + echelle.pluriel;
+            } else {
+              texte = echelle.nom;
+              if (echelle.nom === 'mille') {
+                texte = 'mille'; // "mille" reste invariable
+              }
+            }
+
+            if (reste > 0) {
+              // Pour "mille", on ne met pas d'espace supplémentaire si le reste < 100
+              if (echelle.valeur === 1000 && reste < 100) {
+                texte += ' ';
+              } else {
+                texte += ' ';
+              }
+              texte += convertirNombre(reste);
+            }
+
+            return texte;
+          }
         }
-        return n.toString(); // Pour les nombres très grands
+
+        return 'nombre trop grand';
       }
 
       const partieEntiere = Math.floor(montant);
       const centimes = Math.round((montant - partieEntiere) * 100);
 
       let result = convertirNombre(partieEntiere) + ' Ariary';
-      if (centimes > 0) result += convertirNombre(centimes);
+      if (centimes > 0) {
+        result += ' et ' + convertirNombre(centimes) + ' centimes';
+      }
 
-      return result;
+      // Mettre la première lettre en majuscule
+      return result.charAt(0).toUpperCase() + result.slice(1);
     }
 
     // ===== Utilisation dans le PDF =====
