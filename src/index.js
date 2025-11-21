@@ -63,24 +63,27 @@ app.get('/api/compteurs', authenticate, async (req, res) => {
 // POST compteur - Admin et Inserteur seulement
 app.post('/api/compteurs', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
-    const { quartier, localisation, loue, codeImmeuble, nomPropriete, rg, typeBien, province, adresse, sousCompteurs, typeCompteur } = req.body;
+    const { quartier, localisation, loue, codeImmeuble,codeLocal, nomPropriete, rg, typeBien, province, adresse, sousCompteurs } = req.body;
+
     const newC = await prisma.compteur.create({
       data: {
         quartier,
         localisation,
         loue: !!loue,
         codeImmeuble,
+        codeLocal,
         nomPropriete,
         rg,
         typeBien,
         province,
         adresse,
-        sousCompteurs: {
+        // Créer les sous-compteurs seulement s'ils sont fournis et non vides
+        sousCompteurs: sousCompteurs && sousCompteurs.length > 0 ? {
           create: sousCompteurs.map(sc => ({
             numeroCompteur: sc.numeroCompteur,
             typeCompteur: sc.typeCompteur || "eau"
           }))
-        }
+        } : undefined
       },
       include: { sousCompteurs: true }
     });
@@ -106,6 +109,7 @@ app.put('/api/compteurs/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR']),
           localisation: data.localisation,
           loue: data.loue ?? undefined,
           codeImmeuble: data.codeImmeuble,
+          codeLocal: data.codeLocal,
           nomPropriete: data.nomPropriete,
           rg: data.rg,
           typeBien: data.typeBien,
@@ -166,9 +170,9 @@ app.delete('/api/compteurs/:id', authenticate, requireRole(['ADMIN']), async (re
 // POST sous-compteur - Admin et Inserteur seulement
 app.post('/api/souscompteurs', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
-    const { compteurId, numeroCompteur, numeroFacture, montant } = req.body;
+    const { compteurId, numeroCompteur, numeroFacture, montant, moisFacture, anneeFacture } = req.body;
     const newSous = await prisma.sousCompteur.create({
-      data: { compteurId, numeroCompteur, numeroFacture, montant }
+      data: { compteurId, numeroCompteur, numeroFacture, montant, moisFacture, anneeFacture }
     });
     res.status(201).json(newSous);
   } catch (err) {
@@ -180,10 +184,15 @@ app.post('/api/souscompteurs', authenticate, requireRole(['ADMIN', 'INSERTEUR'])
 app.put('/api/souscompteurs/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const { numeroFacture, montant } = req.body;
+    const { numeroFacture, montant, moisFacture, anneeFacture } = req.body;
     const updated = await prisma.sousCompteur.update({
       where: { id },
-      data: { numeroFacture: numeroFacture ?? null, montant: montant ?? null }
+      data: {
+        numeroFacture: numeroFacture ?? null,
+        montant: montant ?? null,
+        moisFacture: moisFacture ?? null,
+        anneeFacture: anneeFacture ?? null
+      }
     });
     res.json(updated);
   } catch (err) {
@@ -303,16 +312,17 @@ app.delete('/api/payment-batches/:id/recu', authenticate, requireRole(['ADMIN'])
 // POST paiement batch - Admin et Inserteur seulement
 app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
-    const { moisPaiement, anneePaiement } = req.body; // Récupérer le mois et l'année depuis le frontend
+    const { moisPaiement, anneePaiement } = req.body;
 
     const compteurs = await prisma.compteur.findMany({
       where: { loue: false },
       include: { sousCompteurs: true }
     });
 
+    // Filtrer seulement les sous-compteurs qui ont à la fois numeroCompteur ET (montant > 0)
     const sousCompteurs = compteurs
       .flatMap(c => c.sousCompteurs.map(s => ({ ...s, compteur: c })))
-      .filter(s => s.montant != null && !isNaN(s.montant) && parseFloat(s.montant) > 0);
+      .filter(s => s.numeroCompteur && s.montant != null && !isNaN(s.montant) && parseFloat(s.montant) > 0);
 
     if (!sousCompteurs.length)
       return res.status(400).json({ message: 'Aucun montant à payer' });
@@ -323,8 +333,8 @@ app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR'
       const newBatch = await tx.paymentBatch.create({
         data: {
           total,
-          moisPaiement: moisPaiement || new Date().getMonth() + 1, // Défaut: mois actuel
-          anneePaiement: anneePaiement || new Date().getFullYear() // Défaut: année actuelle
+          moisPaiement: moisPaiement || new Date().getMonth() + 1,
+          anneePaiement: anneePaiement || new Date().getFullYear()
         }
       });
 
@@ -342,7 +352,10 @@ app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR'
 
         await tx.sousCompteur.update({
           where: { id: s.id },
-          data: { montant: null, numeroFacture: null }
+          data: {
+            montant: null,
+            numeroFacture: null
+          }
         });
       }
 
@@ -394,11 +407,39 @@ app.delete('/api/payment-batches/:id', authenticate, requireRole(['ADMIN']), asy
     const id = Number(req.params.id);
 
     await prisma.$transaction(async (tx) => {
+      // 1. Récupérer tous les paiements du batch avant suppression
+      const payments = await tx.payment.findMany({
+        where: { batchId: id },
+        select: {
+          id: true,
+          numeroFacture: true,
+          montant: true,
+          numeroCompteur: true,
+          typeCompteur: true,
+          compteurId: true
+        }
+      });
+
+      // 2. Restaurer les informations dans les sous-compteurs correspondants
+      for (const payment of payments) {
+        // Trouver le sous-compteur correspondant au numéro de compteur et type
+        const sousCompteur = await tx.sousCompteur.findFirst({
+          where: {
+            numeroCompteur: payment.numeroCompteur,
+            typeCompteur: payment.typeCompteur,
+            compteurId: payment.compteurId
+          }
+        });
+      }
+
+      // 3. Supprimer les paiements
       await tx.payment.deleteMany({ where: { batchId: id } });
+
+      // 4. Supprimer le batch
       await tx.paymentBatch.delete({ where: { id } });
     });
 
-    res.json({ message: 'Historique supprimé' });
+    res.json({ message: 'Historique supprimé et données restaurées' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Erreur suppression batch', detail: err.message });
@@ -425,6 +466,10 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     const headers = ['Province', 'Quartier', 'Adresse', 'RG', 'Type', 'N° Facture', 'Montant (Ar)'];
     const tableWidth = colWidths.reduce((a, b) => a + b, 0);
 
+    const BASE_LINE_HEIGHT = 16;
+    const EXTRA_HEIGHT_PER_LINE = 8;
+    const SIGNATURES_HEIGHT_NEEDED = 150;
+
     function formatMontant(valeur) {
       const montant = typeof valeur === 'number' ? valeur : 0;
       return montant.toLocaleString('fr-FR', {
@@ -446,6 +491,57 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
         x += width;
       }
       doc.moveTo(startX + tableWidth, yTop).lineTo(startX + tableWidth, yBottom).stroke();
+    }
+
+    function checkPageBreak(neededHeight) {
+      const currentY = doc.y;
+      const pageHeight = doc.page.height;
+      const bottomMargin = 60;
+
+      if (currentY + neededHeight > pageHeight - bottomMargin) {
+        doc.addPage();
+        return true;
+      }
+      return false;
+    }
+
+    function drawTableHeaders() {
+      const y = doc.y + 10;
+
+      doc.font('Helvetica-Bold').fontSize(11);
+      drawHorizontalLine(y);
+      let x = startX;
+      headers.forEach((h, i) => {
+        doc.text(h, x, y + 8, { width: colWidths[i], align: 'center' });
+        x += colWidths[i];
+      });
+      doc.y = y + 25;
+      drawHorizontalLine(doc.y);
+      drawVerticalLines(y, doc.y);
+
+      doc.font('Helvetica').fontSize(10);
+      return doc.y;
+    }
+
+    function getCellHeight(text, columnIndex) {
+      const maxWidth = colWidths[columnIndex] - 4;
+      const lines = doc.heightOfString(text, {
+        width: maxWidth,
+        align: 'center'
+      }) / BASE_LINE_HEIGHT;
+
+      return Math.max(1, Math.ceil(lines)) * BASE_LINE_HEIGHT + EXTRA_HEIGHT_PER_LINE;
+    }
+
+    function getRowHeight(cells) {
+      let maxHeight = BASE_LINE_HEIGHT;
+      cells.forEach((text, i) => {
+        const cellHeight = getCellHeight(text, i);
+        if (cellHeight > maxHeight) {
+          maxHeight = cellHeight;
+        }
+      });
+      return maxHeight;
     }
 
     // ======== Regrouper par numeroFacture ========
@@ -478,8 +574,6 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
 
     // ======== En-tête PDF ========
     const dateBatch = new Date(batch.date);
-    const mois = dateBatch.toLocaleString('fr-FR', { month: 'long' });
-    const annee = dateBatch.getFullYear();
     const moisPaiement = batch.moisPaiement || new Date(batch.date).getMonth() + 1;
     const anneePaiement = batch.anneePaiement || new Date(batch.date).getFullYear();
 
@@ -499,227 +593,289 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     doc.moveDown(1.5);
 
     // ======== Tableau ========
-    let y = doc.y + 10;
+    let y = drawTableHeaders();
 
-    // En-têtes du tableau (gras)
-    doc.font('Helvetica-Bold').fontSize(11);
-    drawHorizontalLine(y);
-    let x = startX;
-    headers.forEach((h, i) => {
-      doc.text(h, x, y + 5, { width: colWidths[i], align: 'center' });
-      x += colWidths[i];
-    });
-    y += 20;
-    drawHorizontalLine(y);
-    drawVerticalLines(y - 20, y);
-
-    // Contenu du tableau
-    doc.font('Helvetica').fontSize(10);
     let currentQuartier = null;
     let sousTotal = 0;
     let yStartQuartier = y;
+    let isNewPage = false;
 
-    for (let p of paiementsTries) {
+    // CORRECTION : Traiter chaque paiement avec une logique améliorée
+    for (let i = 0; i < paiementsTries.length; i++) {
+      const p = paiementsTries[i];
       const c = p.compteur;
       const quartier = c.quartier || 'Non défini';
 
-      // Sous-total si changement de quartier
-      if (currentQuartier && currentQuartier !== quartier) {
-        y += 4;
-        drawHorizontalLine(y);
-        y += 4;
-        x = startX;
-        for (let i = 0; i < 5; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-        doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
-        x += colWidths[5];
-        doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
+      // Préparer les cellules AVANT de vérifier le saut de page
+      const cells = [
+        c.province || 'N/A',
+        quartier,
+        c.adresse || '-',
+        c.rg || '-',
+        Array.isArray(p.typeCompteur) ? p.typeCompteur.join(' / ') : p.typeCompteur || '-',
+        p.numeroFacture || 'N/A',
+        formatMontant(p.montant)
+      ];
 
-        y += 16;
-        drawHorizontalLine(y);
-        drawVerticalLines(yStartQuartier, y);
+      const rowHeight = getRowHeight(cells);
+
+      // CORRECTION : Vérifier s'il faut afficher le sous-total AVANT de traiter la nouvelle ligne
+      if (currentQuartier && currentQuartier !== quartier) {
+        // Vérifier l'espace pour le sous-total
+        if (checkPageBreak(30)) {
+          y = drawTableHeaders();
+          yStartQuartier = y;
+          isNewPage = true;
+        }
+
+        // Afficher le sous-total du quartier précédent
+        if (!isNewPage) {
+          y += 6;
+          drawHorizontalLine(y);
+          y += 6;
+          let x = startX;
+
+          // Cellules vides pour les premières colonnes
+          for (let j = 0; j < 5; j++) {
+            doc.text('', x, y, { width: colWidths[j], align: 'center' });
+            x += colWidths[j];
+          }
+
+          // Sous-total
+          doc.font('Helvetica-Bold');
+          doc.text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
+          x += colWidths[5];
+          doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
+          doc.font('Helvetica');
+
+          y += 20;
+          drawHorizontalLine(y);
+          drawVerticalLines(yStartQuartier, y);
+        } else {
+          // Si nouvelle page, réinitialiser le sous-total
+          sousTotal = 0;
+        }
+
+        // Réinitialiser pour le nouveau quartier
         yStartQuartier = y;
         sousTotal = 0;
-        doc.font('Helvetica').fontSize(10);
+        isNewPage = false;
+      }
+
+      // Vérifier l'espace pour la nouvelle ligne
+      if (checkPageBreak(rowHeight + SIGNATURES_HEIGHT_NEEDED)) {
+        y = drawTableHeaders();
+        yStartQuartier = y;
+        isNewPage = true;
       }
 
       currentQuartier = quartier;
       sousTotal += p.montant || 0;
 
       // Ligne du paiement
-      y += 4;
-      x = startX;
-      const cells = [
-        c.province || 'N/A',
-        quartier,
-        c.adresse || '-',
-        c.rg || '-',
-        p.typeCompteur.join(' / '),
-        p.numeroFacture || 'N/A',
-        formatMontant(p.montant)
-      ];
+      y += 6;
+      let x = startX;
 
       cells.forEach((text, i) => {
-        doc.text(text, x, y, { width: colWidths[i], align: 'center' });
+        doc.text(text, x, y + (rowHeight - BASE_LINE_HEIGHT) / 2, {
+          width: colWidths[i],
+          align: 'center',
+          height: rowHeight
+        });
         x += colWidths[i];
       });
 
-      y += 16;
+      y += rowHeight;
       drawHorizontalLine(y);
-      drawVerticalLines(y - 20, y);
+      drawVerticalLines(y - rowHeight - 6, y);
     }
 
-    // Dernier sous-total
-    y += 4;
-    drawHorizontalLine(y);
-    y += 4;
-    x = startX;
-    for (let i = 0; i < 5; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-    doc.font('Helvetica-Bold').text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
-    x += colWidths[5];
-    doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
-    y += 16;
-    drawHorizontalLine(y);
-    drawVerticalLines(yStartQuartier, y);
+    // CORRECTION : Afficher le dernier sous-total (pour le dernier quartier)
+    if (currentQuartier) {
+      // Vérifier l'espace pour le sous-total
+      if (checkPageBreak(30)) {
+        y = drawTableHeaders();
+        yStartQuartier = y;
+      }
+
+      y += 6;
+      drawHorizontalLine(y);
+      y += 6;
+      let x = startX;
+
+      for (let i = 0; i < 5; i++) {
+        doc.text('', x, y, { width: colWidths[i], align: 'center' });
+        x += colWidths[i];
+      }
+
+      doc.font('Helvetica-Bold');
+      doc.text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
+      x += colWidths[5];
+      doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
+      doc.font('Helvetica');
+
+      y += 20;
+      drawHorizontalLine(y);
+      drawVerticalLines(yStartQuartier, y);
+    }
 
     // Total général
-    y += 4;
+    const yStartTotal = y;
+    y += 6;
     drawHorizontalLine(y);
-    y += 4;
-    x = startX;
-    for (let i = 0; i < 5; i++) { doc.text('', x, y, { width: colWidths[i], align: 'center' }); x += colWidths[i]; }
-    doc.font('Helvetica-Bold').text('TOTAL GÉNÉRAL', x, y, { width: colWidths[5], align: 'center' });
+    y += 6;
+    let x = startX;
+
+    for (let i = 0; i < 5; i++) {
+      doc.text('', x, y, { width: colWidths[i], align: 'center' });
+      x += colWidths[i];
+    }
+
+    doc.font('Helvetica-Bold');
+    doc.text('TOTAL GÉNÉRAL', x, y, { width: colWidths[5], align: 'center' });
     x += colWidths[5];
     doc.text(formatMontant(totalGeneral), x, y, { width: colWidths[6], align: 'center' });
-    y += 16;
+    doc.font('Helvetica');
+
+    y += 20;
     drawHorizontalLine(y);
-    drawVerticalLines(yStartQuartier, y);
+    drawVerticalLines(yStartTotal, y);
 
-function montantEnLettres(montant) {
-  const chiffres = [
-    '', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf',
-    'dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize',
-    'dix-sept', 'dix-huit', 'dix-neuf'
-  ];
-  const dizaines = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante', 'soixante', 'quatre-vingt', 'quatre-vingt'];
+    // Vérifier l'espace pour la suite
+    checkPageBreak(SIGNATURES_HEIGHT_NEEDED);
 
-  function convertirNombre(n, estCentime = false) {
-    if (n === 0) return 'zéro';
-    if (n < 20) return chiffres[n];
-    if (n < 100) {
-      let unite = n % 10;
-      let dizaine = Math.floor(n / 10);
-      
-      if ((dizaine === 7 || dizaine === 9) && unite === 0) {
-        return dizaines[dizaine];
-      }
-      if (dizaine === 8 && unite === 0) {
-        return dizaines[dizaine] + 's';
-      }
-      if (dizaine === 7 || dizaine === 9) {
-        return dizaines[dizaine] + '-' + chiffres[10 + unite];
-      }
-      
-      let sep = (unite === 1 && dizaine !== 8) ? '-et-' : '-';
-      if (unite === 0) return dizaines[dizaine];
-      return dizaines[dizaine] + sep + chiffres[unite];
-    }
-    if (n < 1000) {
-      let reste = n % 100;
-      let centaine = Math.floor(n / 100);
-      let texte = '';
-      
-      if (centaine > 1) {
-        texte = chiffres[centaine] + ' cent';
-        if (reste === 0) texte += 's';
-      } else {
-        texte = 'cent';
-      }
-      
-      if (reste > 0) {
-        texte += ' ' + convertirNombre(reste);
-      }
-      return texte;
-    }
-    
-    const echelles = [
-      { valeur: 1000000000000, nom: 'billion', pluriel: 'billions' },
-      { valeur: 1000000000, nom: 'milliard', pluriel: 'milliards' },
-      { valeur: 1000000, nom: 'million', pluriel: 'millions' },
-      { valeur: 1000, nom: 'mille', pluriel: 'mille' }
-    ];
-    
-    for (let echelle of echelles) {
-      if (n >= echelle.valeur) {
-        let quotient = Math.floor(n / echelle.valeur);
-        let reste = n % echelle.valeur;
-        
-        let texte = '';
-        // CORRECTION : Toujours convertir le quotient, même s'il vaut 1
-        if (quotient >= 1) {
-          texte = convertirNombre(quotient) + ' ' + (quotient > 1 ? echelle.pluriel : echelle.nom);
-        } else {
-          texte = echelle.nom;
-        }
-        
-        if (reste > 0) {
-          if (echelle.valeur === 1000 && reste < 100) {
-            texte += ' ';
-          } else {
-            texte += ' ';
+    function montantEnLettres(montant) {
+      const chiffres = [
+        '', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf',
+        'dix', 'onze', 'douze', 'treize', 'quatorze', 'quinze', 'seize',
+        'dix-sept', 'dix-huit', 'dix-neuf'
+      ];
+      const dizaines = ['', '', 'vingt', 'trente', 'quarante', 'cinquante', 'soixante', 'soixante', 'quatre-vingt', 'quatre-vingt'];
+
+      function convertirNombre(n, estCentime = false) {
+        if (n === 0) return 'zéro';
+        if (n < 20) return chiffres[n];
+        if (n < 100) {
+          let unite = n % 10;
+          let dizaine = Math.floor(n / 10);
+
+          if ((dizaine === 7 || dizaine === 9) && unite === 0) {
+            return dizaines[dizaine];
           }
-          texte += convertirNombre(reste);
+          if (dizaine === 8 && unite === 0) {
+            return dizaines[dizaine] + 's';
+          }
+          if (dizaine === 7 || dizaine === 9) {
+            return dizaines[dizaine] + '-' + chiffres[10 + unite];
+          }
+
+          let sep = (unite === 1 && dizaine !== 8) ? '-et-' : '-';
+          if (unite === 0) return dizaines[dizaine];
+          return dizaines[dizaine] + sep + chiffres[unite];
         }
-        
-        return texte;
+        if (n < 1000) {
+          let reste = n % 100;
+          let centaine = Math.floor(n / 100);
+          let texte = '';
+
+          if (centaine > 1) {
+            texte = chiffres[centaine] + ' cent';
+            if (reste === 0) texte += 's';
+          } else {
+            texte = 'cent';
+          }
+
+          if (reste > 0) {
+            texte += ' ' + convertirNombre(reste);
+          }
+          return texte;
+        }
+
+        const echelles = [
+          { valeur: 1000000000000, nom: 'billion', pluriel: 'billions' },
+          { valeur: 1000000000, nom: 'milliard', pluriel: 'milliards' },
+          { valeur: 1000000, nom: 'million', pluriel: 'millions' },
+          { valeur: 1000, nom: 'mille', pluriel: 'mille' }
+        ];
+
+        for (let echelle of echelles) {
+          if (n >= echelle.valeur) {
+            let quotient = Math.floor(n / echelle.valeur);
+            let reste = n % echelle.valeur;
+
+            let texte = '';
+            if (quotient >= 1) {
+              texte = convertirNombre(quotient) + ' ' + (quotient > 1 ? echelle.pluriel : echelle.nom);
+            } else {
+              texte = echelle.nom;
+            }
+
+            if (reste > 0) {
+              if (echelle.valeur === 1000 && reste < 100) {
+                texte += ' ';
+              } else {
+                texte += ' ';
+              }
+              texte += convertirNombre(reste);
+            }
+
+            return texte;
+          }
+        }
+
+        return 'nombre trop grand';
       }
+
+      const partieEntiere = Math.floor(montant);
+      const centimes = Math.round((montant - partieEntiere) * 100);
+
+      let result = convertirNombre(partieEntiere) + ' Ariary';
+
+      if (centimes > 0) {
+        let centimesTexte;
+        if (centimes < 10) {
+          centimesTexte = 'zéro ' + convertirNombre(centimes);
+        } else {
+          centimesTexte = convertirNombre(centimes);
+        }
+
+        result += ' ' + centimesTexte;
+      }
+
+      return result.charAt(0).toUpperCase() + result.slice(1);
     }
-    
-    return 'nombre trop grand';
-  }
-
-  const partieEntiere = Math.floor(montant);
-  const centimes = Math.round((montant - partieEntiere) * 100);
-
-  let result = convertirNombre(partieEntiere) + ' Ariary';
-  
-  if (centimes > 0) {
-    // CORRECTION : Ajouter "zéro" pour les centimes < 10
-    let centimesTexte;
-    if (centimes < 10) {
-      centimesTexte = 'zéro ' + convertirNombre(centimes);
-    } else {
-      centimesTexte = convertirNombre(centimes);
-    }
-    
-    result += ' et ' + centimesTexte;
-  }
-
-  return result.charAt(0).toUpperCase() + result.slice(1);
-}
 
     // ===== Utilisation dans le PDF =====
-    y += 20;
+    y += 17;
     doc.font('Helvetica-Bold').fontSize(12).text(
       `Montant Total : ${montantEnLettres(totalGeneral)}`,
       startX,
       y,
       { align: 'left' }
     );
-    y += 30;
+    y += 25;
 
-    // Signatures
-    y += 20;
+    // ===== SIGNATURES =====
+    checkPageBreak(SIGNATURES_HEIGHT_NEEDED);
+
+    y += 40;
+
     const signatures = [
       'Services Etudes et Travaux',
-      'Services Administratif et Financiers',
+      'Responsable Administratif et Financier',
       'Tolotra RANDRIANALAINA',
       'Haingo RAZAFINIAINA'
     ];
+
     const sigColWidth = tableWidth / 2 + 20;
     doc.font('Helvetica').fontSize(11);
+
+    // Première ligne de signatures
     doc.text(signatures[0], startX, y, { width: sigColWidth, align: 'center' });
     doc.text(signatures[1], startX + sigColWidth + 20, y, { width: sigColWidth, align: 'center' });
-    y += 60;
+
+    // Deuxième ligne de signatures
+    y += 80;
     doc.text(signatures[2], startX, y, { width: sigColWidth, align: 'center' });
     doc.text(signatures[3], startX + sigColWidth + 20, y, { width: sigColWidth, align: 'center' });
 

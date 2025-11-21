@@ -46,11 +46,12 @@ model Compteur {
   quartier      String
   localisation  String
   loue          Boolean        @default(false)
-  codeImmeuble  String         @default("N/A")
+  codeImmeuble  String?        @default("N/A")
+  codeLocal     String?        @default("N/A")
   nomPropriete  String         @default("N/A")
   typeBien      String         @default("placement")
   province      String         @default("N/A")
-  adresse       String         @default("N/A")
+  adresse       String?        @default("N/A")
   rg            String
 
   sousCompteurs SousCompteur[]
