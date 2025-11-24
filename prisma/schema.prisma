@@ -62,10 +62,24 @@ model SousCompteur {
   id             Int       @id @default(autoincrement())
   numeroCompteur String    @unique
   typeCompteur   String    @default("eau")
-  numeroFacture  String?
-  montant        Float?
   compteurId     Int
   compteur       Compteur  @relation(fields: [compteurId], references: [id])
+  factures       Facture[] // Nouvelle relation
+}
+
+// Nouveau modèle pour gérer plusieurs factures
+model Facture {
+  id              Int          @id @default(autoincrement())
+  numeroFacture   String
+  montant         Float
+  mois            Int         // Mois de la facture (1-12)
+  annee           Int         // Année de la facture
+  sousCompteurId  Int
+  sousCompteur    SousCompteur @relation(fields: [sousCompteurId], references: [id])
+  payee           Boolean     @default(false)
+  batchId         Int?
+  batch           PaymentBatch? @relation(fields: [batchId], references: [id])
+  createdAt       DateTime    @default(now())
 }
 
 model PaymentBatch {
@@ -73,10 +87,11 @@ model PaymentBatch {
   date      DateTime  @default(now())
   total     Float
   payments  Payment[]
+  factures  Facture[]  // Ajouter cette ligne pour la relation inverse
   chequePdf String?
   recuPdf String?
-  moisPaiement Int?   // Nouveau champ: mois du paiement (1-12)
-  anneePaiement Int?  // Nouveau champ: année du paiement
+  moisPaiement Int?
+  anneePaiement Int?
 }
 
 model Payment {

@@ -50,7 +50,17 @@ app.get('/api/compteurs', authenticate, async (req, res) => {
 
     const compteurs = await prisma.compteur.findMany({
       where,
-      include: { sousCompteurs: true },
+      include: {
+        sousCompteurs: {
+          include: {
+            factures: {
+              where: {
+                payee: false // Inclure seulement les factures non payées
+              }
+            }
+          }
+        }
+      },
       orderBy: { id: 'asc' }
     });
     res.json(compteurs);
@@ -63,7 +73,7 @@ app.get('/api/compteurs', authenticate, async (req, res) => {
 // POST compteur - Admin et Inserteur seulement
 app.post('/api/compteurs', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
   try {
-    const { quartier, localisation, loue, codeImmeuble,codeLocal, nomPropriete, rg, typeBien, province, adresse, sousCompteurs } = req.body;
+    const { quartier, localisation, loue, codeImmeuble, codeLocal, nomPropriete, rg, typeBien, province, adresse, sousCompteurs } = req.body;
 
     const newC = await prisma.compteur.create({
       data: {
@@ -114,29 +124,75 @@ app.put('/api/compteurs/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR']),
           rg: data.rg,
           typeBien: data.typeBien,
           province: data.province,
-          adresse: data.adresse,
-          typeCompteur: data.typeCompteur
+          adresse: data.adresse
         }
       });
 
-      // 2️⃣ Supprime les anciens sous-compteurs
-      await tx.sousCompteur.deleteMany({ where: { compteurId: id } });
-
-      // 3️⃣ Ajoute les nouveaux sous-compteurs
-      if (Array.isArray(data.sousCompteurs) && data.sousCompteurs.length > 0) {
-        await tx.sousCompteur.createMany({
-          data: data.sousCompteurs.map(sc => ({
-            numeroCompteur: sc.numeroCompteur,
-            typeCompteur: sc.typeCompteur || "eau",
-            compteurId: id
-          }))
+      // 2️⃣ Gestion des sous-compteurs avec suppression des factures si nécessaire
+      if (Array.isArray(data.sousCompteurs)) {
+        // Récupérer les sous-compteurs existants
+        const sousCompteursExistants = await tx.sousCompteur.findMany({
+          where: { compteurId: id },
+          include: { factures: true }
         });
+
+        // Identifier les sous-compteurs à supprimer
+        const nouveauxNumeros = data.sousCompteurs.map(sc => sc.numeroCompteur);
+        const sousCompteursASupprimer = sousCompteursExistants.filter(sc =>
+          !nouveauxNumeros.includes(sc.numeroCompteur)
+        );
+
+        // Supprimer d'abord les factures des sous-compteurs à supprimer
+        for (const sc of sousCompteursASupprimer) {
+          if (sc.factures && sc.factures.length > 0) {
+            await tx.facture.deleteMany({
+              where: { sousCompteurId: sc.id }
+            });
+          }
+        }
+
+        // Supprimer les sous-compteurs
+        await tx.sousCompteur.deleteMany({
+          where: {
+            id: { in: sousCompteursASupprimer.map(sc => sc.id) }
+          }
+        });
+
+        // Mettre à jour ou créer les sous-compteurs
+        for (const scData of data.sousCompteurs) {
+          const sousCompteurExistant = sousCompteursExistants.find(
+            sc => sc.numeroCompteur === scData.numeroCompteur
+          );
+
+          if (sousCompteurExistant) {
+            await tx.sousCompteur.update({
+              where: { id: sousCompteurExistant.id },
+              data: {
+                typeCompteur: scData.typeCompteur || "eau"
+              }
+            });
+          } else {
+            await tx.sousCompteur.create({
+              data: {
+                numeroCompteur: scData.numeroCompteur,
+                typeCompteur: scData.typeCompteur || "eau",
+                compteurId: id
+              }
+            });
+          }
+        }
       }
 
-      // 4️⃣ Retourne le compteur avec ses nouveaux sous-compteurs
+      // 3️⃣ Retourne le compteur mis à jour
       return tx.compteur.findUnique({
         where: { id },
-        include: { sousCompteurs: true }
+        include: {
+          sousCompteurs: {
+            include: {
+              factures: true
+            }
+          }
+        }
       });
     });
 
@@ -198,6 +254,83 @@ app.put('/api/souscompteurs/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR
   } catch (err) {
     console.error(err);
     res.status(400).json({ message: 'Erreur mise à jour sous-compteur', detail: err.message });
+  }
+});
+
+// Nouvelle route pour ajouter une facture
+app.post('/api/factures', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
+  try {
+    const { sousCompteurId, numeroFacture, montant, mois, annee } = req.body;
+
+    console.log('Données reçues:', { sousCompteurId, numeroFacture, montant, mois, annee }); // Debug
+
+    const nouvelleFacture = await prisma.facture.create({
+      data: {
+        sousCompteurId: parseInt(sousCompteurId),
+        numeroFacture,
+        montant: parseFloat(montant),
+        mois: parseInt(mois),
+        annee: parseInt(annee)
+      },
+      include: {
+        sousCompteur: {
+          include: {
+            compteur: true
+          }
+        }
+      }
+    });
+
+    res.status(201).json(nouvelleFacture);
+  } catch (err) {
+    console.error('Erreur création facture:', err);
+    res.status(400).json({ message: 'Erreur création facture', detail: err.message });
+  }
+});
+
+// Route pour supprimer une facture
+app.delete('/api/factures/:id', authenticate, requireRole(['ADMIN', 'INSERTEUR']), async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+
+    await prisma.facture.delete({
+      where: { id }
+    });
+
+    res.json({ message: 'Facture supprimée' });
+  } catch (err) {
+    console.error('Erreur suppression facture:', err);
+    res.status(400).json({ message: 'Erreur suppression facture', detail: err.message });
+  }
+});
+
+// Modifier la route GET compteurs pour inclure les factures
+app.get('/api/compteurs', authenticate, async (req, res) => {
+  try {
+    const loueParam = req.query.loue;
+    const where = {};
+    if (loueParam === 'true') where.loue = true;
+    if (loueParam === 'false') where.loue = false;
+
+    const compteurs = await prisma.compteur.findMany({
+      where,
+      include: {
+        sousCompteurs: {
+          include: {
+            factures: {
+              where: {
+                payee: false
+              }
+            }
+          }
+        }
+      },
+      orderBy: { id: 'asc' }
+    });
+    res.json(compteurs);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Erreur serveur' });
   }
 });
 
@@ -314,20 +447,29 @@ app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR'
   try {
     const { moisPaiement, anneePaiement } = req.body;
 
-    const compteurs = await prisma.compteur.findMany({
-      where: { loue: false },
-      include: { sousCompteurs: true }
+    // Récupérer toutes les factures non payées des compteurs non loués
+    const factures = await prisma.facture.findMany({
+      where: {
+        payee: false,
+        sousCompteur: {
+          compteur: {
+            loue: false
+          }
+        }
+      },
+      include: {
+        sousCompteur: {
+          include: {
+            compteur: true
+          }
+        }
+      }
     });
 
-    // Filtrer seulement les sous-compteurs qui ont à la fois numeroCompteur ET (montant > 0)
-    const sousCompteurs = compteurs
-      .flatMap(c => c.sousCompteurs.map(s => ({ ...s, compteur: c })))
-      .filter(s => s.numeroCompteur && s.montant != null && !isNaN(s.montant) && parseFloat(s.montant) > 0);
+    if (!factures.length)
+      return res.status(400).json({ message: 'Aucune facture à payer' });
 
-    if (!sousCompteurs.length)
-      return res.status(400).json({ message: 'Aucun montant à payer' });
-
-    const total = sousCompteurs.reduce((sum, s) => sum + parseFloat(s.montant), 0);
+    const total = factures.reduce((sum, f) => sum + parseFloat(f.montant), 0);
 
     const batch = await prisma.$transaction(async (tx) => {
       const newBatch = await tx.paymentBatch.create({
@@ -338,26 +480,50 @@ app.post('/api/payment-batches', authenticate, requireRole(['ADMIN', 'INSERTEUR'
         }
       });
 
-      for (const s of sousCompteurs) {
+      // Grouper les factures par numeroFacture pour conserver la logique d'addition
+      const facturesGroupes = factures.reduce((acc, facture) => {
+        const key = facture.numeroFacture;
+        if (!acc[key]) {
+          acc[key] = {
+            ...facture,
+            montant: facture.montant,
+            typeCompteur: [facture.sousCompteur.typeCompteur],
+            numeroCompteur: [facture.sousCompteur.numeroCompteur],
+            compteurId: facture.sousCompteur.compteurId,
+            compteur: facture.sousCompteur.compteur
+          };
+        } else {
+          acc[key].montant += facture.montant;
+          acc[key].typeCompteur.push(facture.sousCompteur.typeCompteur);
+          acc[key].numeroCompteur.push(facture.sousCompteur.numeroCompteur);
+        }
+        return acc;
+      }, {});
+
+      // Créer les paiements groupés
+      for (const [numeroFacture, factureGroupe] of Object.entries(facturesGroupes)) {
         await tx.payment.create({
           data: {
-            montant: parseFloat(s.montant),
-            numeroFacture: s.numeroFacture,
-            numeroCompteur: s.numeroCompteur,
-            typeCompteur: s.typeCompteur,
-            compteurId: s.compteurId,
+            montant: parseFloat(factureGroupe.montant),
+            numeroFacture: numeroFacture,
+            numeroCompteur: factureGroupe.numeroCompteur.join(' / '),
+            typeCompteur: factureGroupe.typeCompteur.join(' / '),
+            compteurId: factureGroupe.compteurId,
             batchId: newBatch.id
           }
         });
-
-        await tx.sousCompteur.update({
-          where: { id: s.id },
-          data: {
-            montant: null,
-            numeroFacture: null
-          }
-        });
       }
+
+      // Marquer toutes les factures comme payées
+      await tx.facture.updateMany({
+        where: {
+          id: { in: factures.map(f => f.id) }
+        },
+        data: {
+          payee: true,
+          batchId: newBatch.id
+        }
+      });
 
       return newBatch;
     });
@@ -383,13 +549,68 @@ app.get('/api/payment-batches', authenticate, async (req, res) => {
 app.get('/api/payment-batches/:id', authenticate, async (req, res) => {
   try {
     const id = Number(req.params.id);
+
+    // Récupérer le batch avec les factures associées
     const batch = await prisma.paymentBatch.findUnique({
       where: { id },
-      include: { payments: { include: { compteur: true } } }
+      include: {
+        payments: {
+          include: {
+            compteur: true
+          }
+        },
+        // Inclure les factures payées dans ce batch
+        factures: {
+          include: {
+            sousCompteur: {
+              include: {
+                compteur: true
+              }
+            }
+          }
+        }
+      }
     });
 
     if (!batch) return res.status(404).json({ message: 'Batch non trouvé' });
 
+    // Si vous avez des factures, utilisez-les pour construire la réponse
+    if (batch.factures && batch.factures.length > 0) {
+      // Grouper les factures par numéro de facture (comme dans le PDF)
+      const groupedPayments = Object.values(
+        batch.factures.reduce((acc, facture) => {
+          const key = facture.numeroFacture || `nofacture-${facture.id}`;
+          if (!acc[key]) {
+            acc[key] = {
+              id: facture.id,
+              numeroFacture: facture.numeroFacture,
+              montant: facture.montant,
+              mois: facture.mois,
+              annee: facture.annee,
+              typeCompteur: [facture.sousCompteur.typeCompteur],
+              numeroCompteur: [facture.sousCompteur.numeroCompteur],
+              compteurId: facture.sousCompteur.compteurId,
+              compteur: facture.sousCompteur.compteur
+            };
+          } else {
+            acc[key].montant += facture.montant;
+            acc[key].typeCompteur.push(facture.sousCompteur.typeCompteur);
+            acc[key].numeroCompteur.push(facture.sousCompteur.numeroCompteur);
+          }
+          return acc;
+        }, {})
+      );
+
+      const response = {
+        ...batch,
+        payments: groupedPayments,
+        total: parseFloat(batch.total)
+      };
+
+      return res.json(response);
+    }
+
+    // Fallback vers l'ancienne méthode si pas de factures
     const paymentsWithFloat = batch.payments.map(p => ({
       ...p,
       montant: parseFloat(p.montant)
@@ -397,6 +618,7 @@ app.get('/api/payment-batches/:id', authenticate, async (req, res) => {
 
     res.json({ ...batch, payments: paymentsWithFloat, total: parseFloat(batch.total) });
   } catch (err) {
+    console.error('Erreur récupération batch:', err);
     res.status(500).json({ message: 'Erreur récupération batch' });
   }
 });
@@ -452,7 +674,17 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     const id = Number(req.params.id);
     const batch = await prisma.paymentBatch.findUnique({
       where: { id },
-      include: { payments: { include: { compteur: true } } }
+      include: {
+        factures: {
+          include: {
+            sousCompteur: {
+              include: {
+                compteur: true
+              }
+            }
+          }
+        }
+      }
     });
     if (!batch) return res.status(404).json({ message: 'Batch non trouvé' });
 
@@ -461,14 +693,16 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename=batch_${id}.pdf`);
     doc.pipe(res);
 
+    // NOUVELLES COLONNES
     const startX = 15;
-    const colWidths = [80, 80, 80, 70, 70, 90, 90];
-    const headers = ['Province', 'Quartier', 'Adresse', 'RG', 'Type', 'N° Facture', 'Montant (Ar)'];
+    const colWidths = [90, 80, 80, 80, 75, 100, 80];
+    const headers = ['Propriété', 'Localisation', 'RG', 'Type', 'Mois/Année', 'N° Facture', 'Montant (Ar)'];
     const tableWidth = colWidths.reduce((a, b) => a + b, 0);
 
     const BASE_LINE_HEIGHT = 16;
     const EXTRA_HEIGHT_PER_LINE = 8;
     const SIGNATURES_HEIGHT_NEEDED = 150;
+    const MIN_SPACE_FOR_CONTENT = 200; // Espace minimum requis avant de forcer un saut de page
 
     function formatMontant(valeur) {
       const montant = typeof valeur === 'number' ? valeur : 0;
@@ -493,12 +727,26 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       doc.moveTo(startX + tableWidth, yTop).lineTo(startX + tableWidth, yBottom).stroke();
     }
 
-    function checkPageBreak(neededHeight) {
+    function checkPageBreak(neededHeight, forceSignaturePage = false) {
       const currentY = doc.y;
       const pageHeight = doc.page.height;
       const bottomMargin = 60;
 
-      if (currentY + neededHeight > pageHeight - bottomMargin) {
+      // Si on veut forcer les signatures sur la même page
+      if (forceSignaturePage) {
+        if (currentY + neededHeight > pageHeight - bottomMargin) {
+          doc.addPage();
+          return true;
+        }
+        return false;
+      }
+
+      // Vérifier s'il reste suffisamment d'espace pour le contenu + signatures
+      const remainingSpace = pageHeight - currentY - bottomMargin;
+      
+      // Si l'espace restant est insuffisant pour le contenu OU s'il reste trop peu d'espace pour être utile
+      if (currentY + neededHeight > pageHeight - bottomMargin || 
+          remainingSpace < MIN_SPACE_FOR_CONTENT) {
         doc.addPage();
         return true;
       }
@@ -544,48 +792,52 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       return maxHeight;
     }
 
-    // ======== Regrouper par numeroFacture ========
-    const groupedPayments = Object.values(
-      (batch.payments ?? []).reduce((acc, p) => {
-        const key = p.numeroFacture ?? `nofacture-${p.id}`;
+    // ======== Logique de regroupement par numéro de facture ========
+    const facturesGroupes = Object.values(
+      (batch.factures ?? []).reduce((acc, f) => {
+        const key = f.numeroFacture ?? `nofacture-${f.id}`;
         if (!acc[key]) {
           acc[key] = {
-            ...p,
-            typeCompteur: [p.typeCompteur],
-            numeroCompteur: [p.numeroCompteur],
-            montant: p.montant ?? 0
+            ...f,
+            typeCompteur: [f.sousCompteur.typeCompteur],
+            numeroCompteur: [f.sousCompteur.numeroCompteur],
+            montant: f.montant ?? 0,
+            compteur: f.sousCompteur.compteur,
+            mois: f.mois,
+            annee: f.annee
           };
         } else {
-          acc[key].typeCompteur.push(p.typeCompteur);
-          acc[key].numeroCompteur.push(p.numeroCompteur);
-          acc[key].montant += p.montant ?? 0;
+          acc[key].typeCompteur.push(f.sousCompteur.typeCompteur);
+          acc[key].numeroCompteur.push(f.sousCompteur.numeroCompteur);
+          acc[key].montant += f.montant ?? 0;
         }
         return acc;
       }, {})
     );
 
-    const paiementsTries = groupedPayments.sort((a, b) => {
-      const q1 = a.compteur.quartier?.toLowerCase() || '';
-      const q2 = b.compteur.quartier?.toLowerCase() || '';
-      return q1.localeCompare(q2);
+    // Trier par propriété
+    const paiementsTries = facturesGroupes.sort((a, b) => {
+      const p1 = a.compteur.nomPropriete?.toLowerCase() || '';
+      const p2 = b.compteur.nomPropriete?.toLowerCase() || '';
+      return p1.localeCompare(p2);
     });
 
     const totalGeneral = paiementsTries.reduce((sum, p) => sum + (p.montant || 0), 0);
 
     // ======== En-tête PDF ========
     const dateBatch = new Date(batch.date);
-    const moisPaiement = batch.moisPaiement || new Date(batch.date).getMonth() + 1;
-    const anneePaiement = batch.anneePaiement || new Date(batch.date).getFullYear();
+    const moisPaiementBatch = batch.moisPaiement || new Date(batch.date).getMonth() + 1;
+    const anneePaiementBatch = batch.anneePaiement || new Date(batch.date).getFullYear();
 
     const nomsMois = [
       'janvier', 'février', 'mars', 'avril', 'mai', 'juin',
       'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'
     ];
-    const nomMois = nomsMois[moisPaiement - 1];
+    const nomMois = nomsMois[moisPaiementBatch - 1];
 
     doc.fontSize(14).font('Helvetica-Bold').text('Note: Département comptabilité Générales ARO', { align: 'center' });
     doc.moveDown(0.3);
-    doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${nomMois.toUpperCase()} ${anneePaiement}`, { align: 'center' });
+    doc.fontSize(12).text(`OBJET: FACTURE JIRAMA MOIS de ${nomMois.toUpperCase()} ${anneePaiementBatch}`, { align: 'center' });
     doc.moveDown(0.5);
     doc.font('Helvetica').fontSize(11).text("Veuillez émettre à l'ordre de la JIRAMA un chèque de ", { continued: true });
     doc.font('Helvetica-Bold').text(`${formatMontant(totalGeneral)} Ariary`, { continued: true });
@@ -595,84 +847,78 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     // ======== Tableau ========
     let y = drawTableHeaders();
 
-    let currentQuartier = null;
+    let currentPropriete = null;
     let sousTotal = 0;
-    let yStartQuartier = y;
+    let yStartPropriete = y;
     let isNewPage = false;
 
-    // CORRECTION : Traiter chaque paiement avec une logique améliorée
     for (let i = 0; i < paiementsTries.length; i++) {
       const p = paiementsTries[i];
       const c = p.compteur;
-      const quartier = c.quartier || 'Non défini';
+      const propriete = c.nomPropriete || 'Non défini';
 
-      // Préparer les cellules AVANT de vérifier le saut de page
+      const nomMoisFacture = nomsMois[p.mois - 1] || 'Mois inconnu';
+
       const cells = [
-        c.province || 'N/A',
-        quartier,
-        c.adresse || '-',
+        propriete,
+        c.localisation || '-',
         c.rg || '-',
         Array.isArray(p.typeCompteur) ? p.typeCompteur.join(' / ') : p.typeCompteur || '-',
+        `${nomMoisFacture} ${p.annee}`,
         p.numeroFacture || 'N/A',
         formatMontant(p.montant)
       ];
 
       const rowHeight = getRowHeight(cells);
 
-      // CORRECTION : Vérifier s'il faut afficher le sous-total AVANT de traiter la nouvelle ligne
-      if (currentQuartier && currentQuartier !== quartier) {
-        // Vérifier l'espace pour le sous-total
+      // Vérifier s'il faut afficher le sous-total par propriété
+      if (currentPropriete && currentPropriete !== propriete) {
         if (checkPageBreak(30)) {
           y = drawTableHeaders();
-          yStartQuartier = y;
+          yStartPropriete = y;
           isNewPage = true;
         }
 
-        // Afficher le sous-total du quartier précédent
         if (!isNewPage) {
           y += 6;
           drawHorizontalLine(y);
           y += 6;
           let x = startX;
 
-          // Cellules vides pour les premières colonnes
           for (let j = 0; j < 5; j++) {
             doc.text('', x, y, { width: colWidths[j], align: 'center' });
             x += colWidths[j];
           }
 
-          // Sous-total
           doc.font('Helvetica-Bold');
-          doc.text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
+          doc.text(`Sous-total`, x, y, { width: colWidths[5], align: 'center' });
           x += colWidths[5];
           doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
           doc.font('Helvetica');
 
           y += 20;
           drawHorizontalLine(y);
-          drawVerticalLines(yStartQuartier, y);
+          drawVerticalLines(yStartPropriete, y);
         } else {
-          // Si nouvelle page, réinitialiser le sous-total
           sousTotal = 0;
         }
 
-        // Réinitialiser pour le nouveau quartier
-        yStartQuartier = y;
+        yStartPropriete = y;
         sousTotal = 0;
         isNewPage = false;
       }
 
-      // Vérifier l'espace pour la nouvelle ligne
-      if (checkPageBreak(rowHeight + SIGNATURES_HEIGHT_NEEDED)) {
+      // Vérification optimisée du saut de page
+      if (checkPageBreak(rowHeight)) {
         y = drawTableHeaders();
-        yStartQuartier = y;
+        yStartPropriete = y;
         isNewPage = true;
       }
 
-      currentQuartier = quartier;
+      currentPropriete = propriete;
       sousTotal += p.montant || 0;
 
-      // Ligne du paiement
+      // Ligne du paiement groupé
       y += 6;
       let x = startX;
 
@@ -690,12 +936,11 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       drawVerticalLines(y - rowHeight - 6, y);
     }
 
-    // CORRECTION : Afficher le dernier sous-total (pour le dernier quartier)
-    if (currentQuartier) {
-      // Vérifier l'espace pour le sous-total
+    // Afficher le dernier sous-total
+    if (currentPropriete) {
       if (checkPageBreak(30)) {
         y = drawTableHeaders();
-        yStartQuartier = y;
+        yStartPropriete = y;
       }
 
       y += 6;
@@ -709,14 +954,14 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       }
 
       doc.font('Helvetica-Bold');
-      doc.text('Sous-total', x, y, { width: colWidths[5], align: 'center' });
+      doc.text(`Sous-total `, x, y, { width: colWidths[5], align: 'center' });
       x += colWidths[5];
       doc.text(formatMontant(sousTotal), x, y, { width: colWidths[6], align: 'center' });
       doc.font('Helvetica');
 
       y += 20;
       drawHorizontalLine(y);
-      drawVerticalLines(yStartQuartier, y);
+      drawVerticalLines(yStartPropriete, y);
     }
 
     // Total général
@@ -741,8 +986,8 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     drawHorizontalLine(y);
     drawVerticalLines(yStartTotal, y);
 
-    // Vérifier l'espace pour la suite
-    checkPageBreak(SIGNATURES_HEIGHT_NEEDED);
+    // Vérification FORCÉE pour s'assurer que les signatures sont sur la même page
+    checkPageBreak(SIGNATURES_HEIGHT_NEEDED, true);
 
     function montantEnLettres(montant) {
       const chiffres = [
@@ -845,7 +1090,7 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
       return result.charAt(0).toUpperCase() + result.slice(1);
     }
 
-    // ===== Utilisation dans le PDF =====
+    // ===== Montant en lettres =====
     y += 17;
     doc.font('Helvetica-Bold').fontSize(12).text(
       `Montant Total : ${montantEnLettres(totalGeneral)}`,
@@ -856,8 +1101,7 @@ app.get('/api/payment-batches/:id/pdf', authenticate, async (req, res) => {
     y += 25;
 
     // ===== SIGNATURES =====
-    checkPageBreak(SIGNATURES_HEIGHT_NEEDED);
-
+    // Pas besoin de vérifier le saut de page ici car déjà fait avec forceSignaturePage
     y += 40;
 
     const signatures = [
@@ -913,15 +1157,21 @@ app.get('/api/statistiques/evolution', authenticate, async (req, res) => {
       });
     }
 
-    // Récupérer tous les paiements pour ce compteur sur l'année demandée
-    const paiements = await prisma.payment.findMany({
+    // Récupérer toutes les factures payées pour ce compteur sur l'année demandée
+    const factures = await prisma.facture.findMany({
       where: {
-        compteurId: compteur.id,
-        batch: {
-          anneePaiement: parseInt(annee)
+        payee: true,
+        annee: parseInt(annee),
+        sousCompteur: {
+          compteurId: compteur.id
         }
       },
       include: {
+        sousCompteur: {
+          include: {
+            compteur: true
+          }
+        },
         batch: true
       }
     });
@@ -938,11 +1188,11 @@ app.get('/api/statistiques/evolution', authenticate, async (req, res) => {
       };
     }
 
-    // Calculer les montants par mois
-    paiements.forEach(paiement => {
-      const mois = paiement.batch.moisPaiement;
+    // Calculer les montants par mois de facture
+    factures.forEach(facture => {
+      const mois = facture.mois; // Utiliser le mois de la facture
       if (mois >= 1 && mois <= 12) {
-        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+        statistiquesMois[mois].montant += parseFloat(facture.montant || 0);
       }
     });
 
@@ -985,14 +1235,18 @@ app.get('/api/statistiques/general', authenticate, async (req, res) => {
     const { annee } = req.query;
     const anneeCourante = annee ? parseInt(annee) : new Date().getFullYear();
 
-    // Récupérer tous les paiements de l'année
-    const paiements = await prisma.payment.findMany({
+    // Récupérer toutes les factures payées de l'année
+    const factures = await prisma.facture.findMany({
       where: {
-        batch: {
-          anneePaiement: anneeCourante
-        }
+        payee: true,
+        annee: anneeCourante
       },
       include: {
+        sousCompteur: {
+          include: {
+            compteur: true
+          }
+        },
         batch: true
       }
     });
@@ -1006,16 +1260,16 @@ app.get('/api/statistiques/general', authenticate, async (req, res) => {
         mois: mois,
         nomMois: new Date(anneeCourante, mois - 1, 1).toLocaleString('fr-FR', { month: 'long' }),
         montant: 0,
-        nombrePaiements: 0
+        nombreFactures: 0
       };
     }
 
-    // Calculer les montants par mois
-    paiements.forEach(paiement => {
-      const mois = paiement.batch.moisPaiement;
+    // Calculer les montants par mois de facture
+    factures.forEach(facture => {
+      const mois = facture.mois; // Utiliser le mois de la facture
       if (mois >= 1 && mois <= 12) {
-        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
-        statistiquesMois[mois].nombrePaiements += 1;
+        statistiquesMois[mois].montant += parseFloat(facture.montant || 0);
+        statistiquesMois[mois].nombreFactures += 1;
       }
     });
 
@@ -1024,7 +1278,7 @@ app.get('/api/statistiques/general', authenticate, async (req, res) => {
       mois: item.mois,
       nomMois: item.nomMois.charAt(0).toUpperCase() + item.nomMois.slice(1),
       montant: parseFloat(item.montant.toFixed(2)),
-      nombrePaiements: item.nombrePaiements
+      nombrePaiements: item.nombreFactures
     }));
 
     // Calculer les totaux
@@ -1052,8 +1306,6 @@ app.get('/api/statistiques/general', authenticate, async (req, res) => {
    🔹 Export Excel et PDF pour l'évolution
 ================================= */
 
-const ExcelJS = require('exceljs');
-
 // GET export Excel pour l'évolution
 app.get('/api/statistiques/evolution/export-excel', authenticate, async (req, res) => {
   try {
@@ -1076,15 +1328,20 @@ app.get('/api/statistiques/evolution/export-excel', authenticate, async (req, re
       });
     }
 
-    const paiements = await prisma.payment.findMany({
+    const factures = await prisma.facture.findMany({
       where: {
-        compteurId: compteur.id,
-        batch: {
-          anneePaiement: parseInt(annee)
+        payee: true,
+        annee: parseInt(annee),
+        sousCompteur: {
+          compteurId: compteur.id
         }
       },
       include: {
-        batch: true
+        sousCompteur: {
+          include: {
+            compteur: true
+          }
+        }
       }
     });
 
@@ -1098,10 +1355,10 @@ app.get('/api/statistiques/evolution/export-excel', authenticate, async (req, re
       };
     }
 
-    paiements.forEach(paiement => {
-      const mois = paiement.batch.moisPaiement;
+    factures.forEach(facture => {
+      const mois = facture.mois;
       if (mois >= 1 && mois <= 12) {
-        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+        statistiquesMois[mois].montant += parseFloat(facture.montant || 0);
       }
     });
 
@@ -1197,15 +1454,20 @@ app.get('/api/statistiques/evolution/export-pdf', authenticate, async (req, res)
       });
     }
 
-    const paiements = await prisma.payment.findMany({
+    const factures = await prisma.facture.findMany({
       where: {
-        compteurId: compteur.id,
-        batch: {
-          anneePaiement: parseInt(annee)
+        payee: true,
+        annee: parseInt(annee),
+        sousCompteur: {
+          compteurId: compteur.id
         }
       },
       include: {
-        batch: true
+        sousCompteur: {
+          include: {
+            compteur: true
+          }
+        }
       }
     });
 
@@ -1219,10 +1481,10 @@ app.get('/api/statistiques/evolution/export-pdf', authenticate, async (req, res)
       };
     }
 
-    paiements.forEach(paiement => {
-      const mois = paiement.batch.moisPaiement;
+    factures.forEach(facture => {
+      const mois = facture.mois;
       if (mois >= 1 && mois <= 12) {
-        statistiquesMois[mois].montant += parseFloat(paiement.montant || 0);
+        statistiquesMois[mois].montant += parseFloat(facture.montant || 0);
       }
     });
 
@@ -1333,17 +1595,7 @@ app.get('/api/statistiques/evolution/export-pdf', authenticate, async (req, res)
   }
 });
 
-// Fonction utilitaire pour formater les montants (identique à celle existante)
-function formatMontantFR(montant) {
-  if (montant == null) return "-";
-  return montant.toLocaleString('fr-FR', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-    useGrouping: true
-  }).replace(/\u202F/g, ' ') + " Ar";
-}
-
-// Fonction utilitaire pour formater les montants (identique à celle existante)
+// Fonction utilitaire pour formater les montants
 function formatMontantFR(montant) {
   if (montant == null) return "-";
   return montant.toLocaleString('fr-FR', {
