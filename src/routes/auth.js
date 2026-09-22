@@ -387,6 +387,10 @@ async function sendApprovalEmailToAdmin(user) {
         <p>Veuillez choisir le rôle pour cet utilisateur en cliquant sur l'un des liens ci-dessous :</p>
         
         <div style="margin: 20px 0;">
+          <a href="${approvalUrl}?userId=${user.id}&role=ADMIN" 
+             style="background: #e64444; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; margin-right: 10px; display: inline-block;">
+            ✅ Approuver comme Admin
+          </a>
           <a href="${approvalUrl}?userId=${user.id}&role=INSERTEUR" 
              style="background: #007bff; color: white; padding: 12px 24px; text-decoration: none; border-radius: 5px; margin-right: 10px; display: inline-block;">
             ✅ Approuver comme Inserteur
